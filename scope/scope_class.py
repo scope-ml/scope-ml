@@ -5,7 +5,8 @@ import numpy as np
 import os
 import pandas as pd
 import pathlib
-from penquins import Kowalski
+from penquins import Kowalski  # noqa: F401 (retained for backward compatibility of imports from this module)
+from scope.surveys.kowalski import make_kowalski_client
 import subprocess
 import sys
 import tdtax
@@ -54,47 +55,15 @@ class Scope:
                 self.base_path / self.config["training"]["dataset"]
             )
 
-            # use tokens specified as env vars (if exist)
-            kowalski_token_env = os.environ.get("KOWALSKI_INSTANCE_TOKEN")
-            gloria_token_env = os.environ.get("GLORIA_INSTANCE_TOKEN")
-            melman_token_env = os.environ.get("MELMAN_INSTANCE_TOKEN")
-            if kowalski_token_env is not None:
-                self.config["kowalski"]["hosts"]["kowalski"][
-                    "token"
-                ] = kowalski_token_env
-            if gloria_token_env is not None:
-                self.config["kowalski"]["hosts"]["gloria"]["token"] = gloria_token_env
-            if melman_token_env is not None:
-                self.config["kowalski"]["hosts"]["melman"]["token"] = melman_token_env
-
             # Rubin TAP token from environment variable
             rubin_token_env = os.environ.get("RUBIN_TAP_TOKEN")
             if rubin_token_env is not None:
                 self.config["rubin"]["token"] = rubin_token_env
 
-            hosts = [
-                x
-                for x in self.config["kowalski"]["hosts"]
-                if self.config["kowalski"]["hosts"][x]["token"] is not None
-            ]
-            instances = {
-                host: {
-                    "protocol": self.config["kowalski"]["protocol"],
-                    "port": self.config["kowalski"]["port"],
-                    "host": f"{host}.caltech.edu",
-                    "token": self.config["kowalski"]["hosts"][host]["token"],
-                }
-                for host in hosts
-            }
-
-        # try setting up K connection if token is available
-        if len(instances) > 0:
-            with status("Setting up Kowalski connection"):
-                self.kowalski = Kowalski(
-                    timeout=self.config["kowalski"]["timeout"], instances=instances
-                )
-        else:
-            self.kowalski = None
+        # Try setting up Kowalski connection (applies *_INSTANCE_TOKEN env vars internally)
+        with status("Setting up Kowalski connection"):
+            self.kowalski = make_kowalski_client(self.config)
+        if self.kowalski is None:
             # raise ConnectionError("Could not connect to Kowalski.")
             print("Kowalski not available")
 

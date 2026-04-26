@@ -618,22 +618,333 @@ class RubinLocalClient:
         return objects, lightcurves
 
 
-def make_rubin_client(config=None):
+class RubinLocalDiaClient:
+    """
+    Client for querying Rubin LSST DIA data from local parquet files.
+
+    Drop-in replacement for RubinLocalClient that reads from DiaObject
+    and ForcedSourceOnDiaObject tables instead of Object and ForcedSource.
+    Covers all DP1 fields with no isolation restriction.
+
+    Parameters
+    ----------
+    data_path : str
+        Path to directory containing the parquet files.
+    band_map : dict, optional
+        Mapping from band name to integer filter ID.
+    """
+
+    def __init__(self, data_path, band_map=None):
+        import pandas as pd
+
+        self.data_path = data_path
+        self.band_map = band_map or DEFAULT_BAND_MAP
+
+        # Validate that the required files exist
+        required_files = [
+            "DiaObject.parquet.gzip",
+            "ForcedSourceOnDiaObject.parquet.gzip",
+            "Visit.parquet.gzip",
+        ]
+        for fname in required_files:
+            fpath = os.path.join(data_path, fname)
+            if not os.path.isfile(fpath):
+                raise FileNotFoundError(
+                    f"Required file not found: {fpath}. "
+                    f"The data_path directory must contain: {required_files}"
+                )
+
+        # Visit table is small (~203 KB), load eagerly
+        visit_path = os.path.join(data_path, "Visit.parquet.gzip")
+        self._visit_df = pd.read_parquet(
+            visit_path, columns=["visit", "expMidptMJD"]
+        )
+
+        # Lazy-loaded caches
+        self._obj_ids = None
+        self._obj_ra_rad = None
+        self._obj_dec_rad = None
+        self._obj_ra_deg = None
+        self._obj_dec_deg = None
+
+        self._fs_df = None
+
+    def _load_objects(self):
+        """Lazy-load the DiaObject table and precompute radians."""
+        if self._obj_ids is not None:
+            return
+
+        import pandas as pd
+
+        obj_path = os.path.join(self.data_path, "DiaObject.parquet.gzip")
+        df = pd.read_parquet(
+            obj_path,
+            columns=["diaObjectId", "ra", "dec"],
+        )
+
+        self._obj_ids = df["diaObjectId"].values
+        self._obj_ra_deg = df["ra"].values.astype(np.float64)
+        self._obj_dec_deg = df["dec"].values.astype(np.float64)
+
+        # Precompute radians for angular_separation
+        self._obj_ra_rad = np.deg2rad(self._obj_ra_deg)
+        self._obj_dec_rad = np.deg2rad(self._obj_dec_deg)
+
+    def _load_forced_sources(self):
+        """Lazy-load the ForcedSourceOnDiaObject table, joined with Visit."""
+        if self._fs_df is not None:
+            return
+
+        import pandas as pd
+
+        fs_path = os.path.join(
+            self.data_path, "ForcedSourceOnDiaObject.parquet.gzip"
+        )
+        fs_df = pd.read_parquet(
+            fs_path,
+            columns=[
+                "diaObjectId",
+                "visit",
+                "band",
+                "psfFlux",
+                "psfFluxErr",
+                "pixelFlags_bad",
+                "pixelFlags_cr",
+                "pixelFlags_edge",
+                "pixelFlags_saturated",
+                "pixelFlags_suspect",
+            ],
+        )
+
+        # Rename diaObjectId -> objectId for compatibility with _format_as_kowalski
+        fs_df.rename(columns={"diaObjectId": "objectId"}, inplace=True)
+
+        # Join with Visit to get expMidptMJD
+        fs_df = fs_df.merge(self._visit_df, on="visit", how="inner")
+
+        # Compute pixelFlags as sum of boolean columns
+        flag_cols = [
+            "pixelFlags_bad",
+            "pixelFlags_cr",
+            "pixelFlags_edge",
+            "pixelFlags_saturated",
+            "pixelFlags_suspect",
+        ]
+        fs_df["pixelFlags"] = sum(fs_df[c].astype(int) for c in flag_cols)
+
+        # Sort by objectId for searchsorted lookups
+        fs_df.sort_values("objectId", inplace=True)
+        fs_df.reset_index(drop=True, inplace=True)
+
+        # Keep only the columns we need
+        self._fs_df = fs_df[
+            [
+                "objectId",
+                "band",
+                "psfFlux",
+                "psfFluxErr",
+                "expMidptMJD",
+                "pixelFlags",
+            ]
+        ]
+        self._fs_object_ids = self._fs_df["objectId"].values
+
+    def get_objects_by_cone(self, ra, dec, radius_arcsec, limit=10000):
+        """
+        Find DIA objects within a cone search region (no isolation filter).
+
+        Parameters
+        ----------
+        ra : float
+            Right ascension in degrees.
+        dec : float
+            Declination in degrees.
+        radius_arcsec : float
+            Search radius in arcseconds.
+        limit : int, optional
+            Maximum number of objects to return (default 10000).
+
+        Returns
+        -------
+        dict
+            {objectId: {'coord_ra': ra_deg, 'coord_dec': dec_deg}, ...}
+        """
+        from astropy.coordinates import angular_separation
+
+        self._load_objects()
+
+        radius_rad = np.deg2rad(radius_arcsec / 3600.0)
+        center_ra_rad = np.deg2rad(ra)
+        center_dec_rad = np.deg2rad(dec)
+
+        sep = angular_separation(
+            center_ra_rad, center_dec_rad, self._obj_ra_rad, self._obj_dec_rad
+        )
+
+        cone_mask = sep <= radius_rad
+        obj_ids = self._obj_ids[cone_mask]
+        obj_ra = self._obj_ra_deg[cone_mask]
+        obj_dec = self._obj_dec_deg[cone_mask]
+
+        if limit is not None and len(obj_ids) > limit:
+            obj_ids = obj_ids[:limit]
+            obj_ra = obj_ra[:limit]
+            obj_dec = obj_dec[:limit]
+
+        objects = {}
+        for i in range(len(obj_ids)):
+            objects[int(obj_ids[i])] = {
+                "coord_ra": float(obj_ra[i]),
+                "coord_dec": float(obj_dec[i]),
+            }
+
+        return objects
+
+    def get_lightcurves(self, objectids, bands=None, batch_size=1000):
+        """
+        Retrieve forced photometry lightcurves for a list of DIA object IDs.
+
+        Parameters
+        ----------
+        objectids : list of int
+            DIA object IDs to query.
+        bands : list of str, optional
+            Band names to filter (e.g., ['g', 'r']). If None, all bands.
+        batch_size : int, optional
+            Not used for local backend (kept for API compatibility).
+
+        Returns
+        -------
+        list of dict
+            Kowalski-format lightcurve dicts.
+        """
+        if len(objectids) == 0:
+            return []
+
+        self._load_forced_sources()
+
+        # Use searchsorted for efficient lookup
+        oid_set = set(int(oid) for oid in objectids)
+        left_indices = np.searchsorted(
+            self._fs_object_ids, list(oid_set), side="left"
+        )
+        right_indices = np.searchsorted(
+            self._fs_object_ids, list(oid_set), side="right"
+        )
+
+        # Gather row indices
+        idx_list = []
+        for left, right in zip(left_indices, right_indices):
+            if left < right:
+                idx_list.append(np.arange(left, right))
+
+        if len(idx_list) == 0:
+            return []
+
+        all_idx = np.concatenate(idx_list)
+        subset = self._fs_df.iloc[all_idx]
+
+        # Filter by bands if specified
+        if bands is not None and len(bands) > 0:
+            subset = subset[subset["band"].isin(bands)]
+
+        # Filter positive flux
+        subset = subset[(subset["psfFlux"] > 0) & (subset["psfFluxErr"] > 0)]
+
+        if len(subset) == 0:
+            return []
+
+        # Convert to list of dicts for _format_as_kowalski
+        rows = subset.to_dict("records")
+        return _format_as_kowalski(rows, band_map=self.band_map)
+
+    def get_visit_positions(self):
+        """Return visit DataFrame enriched with representative field RA.
+
+        Determines the approximate sky position of each visit by sampling
+        one DIA object observed in that visit and looking up its RA from
+        the DiaObject table.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Copy of the visit table with an added ``fieldRA`` column.
+        """
+        import pandas as pd
+
+        self._load_objects()
+        self._load_forced_sources()
+
+        visit_sample = self._fs_df[["expMidptMJD", "objectId"]].drop_duplicates(
+            "expMidptMJD"
+        )
+
+        obj_ra_lookup = pd.Series(self._obj_ra_deg, index=self._obj_ids)
+        visit_sample = visit_sample.copy()
+        visit_sample["fieldRA"] = visit_sample["objectId"].map(obj_ra_lookup)
+
+        result = self._visit_df.merge(
+            visit_sample[["expMidptMJD", "fieldRA"]],
+            on="expMidptMJD",
+            how="left",
+        )
+
+        return result
+
+    def get_lightcurves_for_cone(
+        self, ra, dec, radius_arcsec, bands=None, limit=10000
+    ):
+        """
+        Convenience method: cone search + lightcurve retrieval in one call.
+
+        Parameters
+        ----------
+        ra : float
+            Right ascension in degrees.
+        dec : float
+            Declination in degrees.
+        radius_arcsec : float
+            Search radius in arcseconds.
+        bands : list of str, optional
+            Band names to filter.
+        limit : int, optional
+            Maximum number of objects from cone search.
+
+        Returns
+        -------
+        objects : dict
+            Object metadata from cone search.
+        lightcurves : list of dict
+            Kowalski-format lightcurve dicts.
+        """
+        objects = self.get_objects_by_cone(ra, dec, radius_arcsec, limit=limit)
+        if len(objects) == 0:
+            return objects, []
+
+        objectids = list(objects.keys())
+        lightcurves = self.get_lightcurves(objectids, bands=bands)
+        return objects, lightcurves
+
+
+def make_rubin_client(config=None, use_dia=False):
     """
     Factory function to create the appropriate Rubin client.
 
-    Returns a RubinLocalClient if a data_path is configured (via config
-    dict or RUBIN_DATA_PATH environment variable), otherwise returns
-    a RubinTAPClient.
+    Returns a RubinLocalClient (or RubinLocalDiaClient if use_dia=True)
+    if a data_path is configured (via config dict or RUBIN_DATA_PATH
+    environment variable), otherwise returns a RubinTAPClient.
 
     Parameters
     ----------
     config : dict, optional
         Rubin config section (e.g., from config['rubin']).
+    use_dia : bool, optional
+        If True, use DiaObject + ForcedSourceOnDiaObject tables instead
+        of Object + ForcedSource. Default False.
 
     Returns
     -------
-    RubinTAPClient or RubinLocalClient
+    RubinTAPClient, RubinLocalClient, or RubinLocalDiaClient
     """
     if config is None:
         config = {}
@@ -642,6 +953,8 @@ def make_rubin_client(config=None):
 
     if data_path:
         band_map = config.get("band_map", DEFAULT_BAND_MAP)
+        if use_dia:
+            return RubinLocalDiaClient(data_path=data_path, band_map=band_map)
         return RubinLocalClient(data_path=data_path, band_map=band_map)
     else:
         return RubinTAPClient(config=config)

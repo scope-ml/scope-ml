@@ -11,7 +11,7 @@ import os
 import numpy as np
 import pytest
 
-from scope.rubin import (
+from scope.surveys.rubin import (
     _flux_to_mag,
     _format_as_kowalski,
     DEFAULT_BAND_MAP,
@@ -301,7 +301,7 @@ class TestIntegrationRubinTAP:
 
     @pytest.fixture(autouse=True)
     def setup_client(self):
-        from scope.rubin import RubinTAPClient
+        from scope.surveys.rubin import RubinTAPClient
 
         self.client = RubinTAPClient(
             tap_url="https://data.lsst.cloud/api/tap",

@@ -1,0 +1,344 @@
+# Hierarchical classifier configuration for SCoPe variable star taxonomy.
+#
+# Taxonomy aligns with timedomain-taxonomy (tdtax) by Josh Bloom:
+#   https://github.com/profjsb/timedomain-taxonomy
+#
+# Our hierarchy simplifies tdtax's ~169 classes into a practical tree
+# that matches the resolution achievable from ZTF light-curve features.
+
+# ──────────────────────────────────────────────────────────────────────
+# Taxonomy tree
+# ──────────────────────────────────────────────────────────────────────
+# Each node has:
+#   name          - internal identifier
+#   classes       - ordered list of class names (index = integer label)
+#   label_map     - maps class name → list of training-set label columns
+#                   A source belongs to a class if max(columns) >= threshold
+#   parent        - name of parent node (null for root)
+#   parent_class  - which parent class gates this node
+#   threshold     - confidence threshold for assigning labels (default 0.5)
+
+taxonomy:
+  # Level 0: variable vs non-variable (binary)
+  # tdtax: top-level split — "Time-domain Source" has stellar-variable vs not
+  vnv:
+    classes: ["non_variable", "variable"]
+    label_map:
+      non_variable: ["non-variable"]
+      variable: ["variable"]
+    parent: null
+    parent_class: null
+
+  # Level 1: periodic vs non-periodic (binary, gated on variable)
+  # tdtax: periodic stellar variables vs aperiodic/irregular
+  pnp:
+    classes: ["non_periodic", "periodic"]
+    label_map:
+      non_periodic: null  # inferred: variable=1 AND periodic=0
+      periodic: ["periodic"]
+    parent: vnv
+    parent_class: variable
+
+  # Level 2a: morphology of periodic variables (4-class)
+  # Maps to tdtax top-level categories: Eclipsing, Pulsating (split by
+  # light-curve shape), and LPV branch
+  morphology:
+    classes: ["eclipsing", "sinusoidal_pulsator", "sawtooth_pulsator", "long_timescale"]
+    label_map:
+      # tdtax: Eclipsing (W Ursae Maj, Algol, Beta Lyrae, Compact Binary, ...)
+      eclipsing: ["eclipsing"]
+      # tdtax: Pulsating with sinusoidal shape — Delta Scuti, RR Lyrae c,
+      #        Gamma Doradus, SX Phe; plus Rotating — RS CVn, ellipsoidal
+      sinusoidal_pulsator: ["sinusoidal", "Delta Scu", "RR Lyrae c",
+                            "RS CVn", "ellipsoidal"]
+      # tdtax: Pulsating with sawtooth/asymmetric shape — RR Lyrae ab,
+      #        Cepheid (Classical, Type II, BL Her, W Vir)
+      sawtooth_pulsator: ["sawtooth", "RR Lyrae ab", "Cepheid"]
+      # tdtax: LPV branch — Mira, Semiregular, OSARG
+      long_timescale: ["long timescale", "LPV", "Mira", "SRV", "OSARG"]
+    parent: pnp
+    parent_class: periodic
+
+  # Level 2b: type of non-periodic variable (4-class)
+  # Maps to tdtax: Eruptive (UV Ceti/flaring, YSO), Nonstellar (AGN),
+  # Cataclysmic (CV), and irregular variability
+  nonperiodic_type:
+    classes: ["irregular", "flaring", "accreting", "yso"]
+    label_map:
+      # tdtax: irregular variability, dipping (folded in)
+      irregular: ["irregular", "dipping"]
+      # tdtax: Eruptive → UV Ceti (flare star)
+      flaring: ["flaring"]
+      # tdtax: Nonstellar → AGN; Cataclysmic → CV (novae, dwarf novae)
+      accreting: ["AGN", "CV"]
+      # tdtax: Eruptive → YSO (FU Ori, T Tauri, Herbig AE/BE)
+      yso: ["YSO"]
+    parent: pnp
+    parent_class: non_periodic
+
+  # Level 3a: eclipsing subtypes (3-class)
+  # tdtax: Eclipsing subtypes — W Ursae Maj, Algol, Beta Lyrae
+  eclipsing_subtype:
+    classes: ["ew_wuma", "ea_detached", "eb_betalyr"]
+    label_map:
+      # tdtax: W Ursae Maj (EW, contact binary, EWa + EWw subtypes)
+      ew_wuma: ["W UMa", "EW"]
+      # tdtax: Algol (EA, semidetached) + detached MS-MS + HW Vir
+      ea_detached: ["EA", "detached eclipsing MS-MS",
+                    "eclipsing sdB+dM (HW Vir)"]
+      # tdtax: Beta Lyrae (EB, giant/supergiant) + compact binary + NN Ser
+      eb_betalyr: ["EB", "Beta Lyr", "compact binary",
+                   "eclipsing WD+dM (NN Ser)", "Redback pulsar"]
+    parent: morphology
+    parent_class: eclipsing
+
+  # Level 3b: sinusoidal pulsator subtypes (3-class)
+  # tdtax: Pulsating subtypes with sinusoidal morphology + Rotating
+  sinusoidal_subtype:
+    classes: ["delta_scuti", "rr_lyrae_c", "rotational"]
+    label_map:
+      # tdtax: Delta Scuti (DSCT, HADS, LADS) + SX Phe + Gamma Doradus
+      delta_scuti: ["Delta Scu"]
+      # tdtax: RR Lyrae → RRc (sinusoidal profile) + RRd (double-mode)
+      rr_lyrae_c: ["RR Lyrae c", "RR Lyrae d"]
+      # tdtax: Rotating → RS CVn; also ellipsoidal (tidal distortion)
+      rotational: ["RS CVn", "ellipsoidal"]
+    parent: morphology
+    parent_class: sinusoidal_pulsator
+
+  # Level 3c: sawtooth pulsator subtypes (3-class)
+  # tdtax: Pulsating subtypes with asymmetric (sawtooth) morphology
+  sawtooth_subtype:
+    classes: ["rr_lyrae_ab", "cepheid", "other_sawtooth"]
+    label_map:
+      # tdtax: RR Lyrae → RRab (steep rise / slow fall) + Blazhko modulation
+      rr_lyrae_ab: ["RR Lyrae ab", "RR Lyrae Blazhko"]
+      # tdtax: Cepheid (Classical, Anomalous) + Population II Cepheid
+      #        (BL Her, W Vir) + RV Tau
+      cepheid: ["Cepheid", "Cepheid type-II", "BL Her", "W Virginis", "RV Tau"]
+      # Remainder: sawtooth label but not clearly RRab or Cepheid
+      other_sawtooth: ["sawtooth"]
+    parent: morphology
+    parent_class: sawtooth_pulsator
+
+  # Orthogonal quality flags (binary, trained on ALL sources)
+  quality_flags:
+    bogus:
+      label_columns: ["bogus"]
+    wrong_period:
+      label_columns: ["wrong period"]
+
+# ──────────────────────────────────────────────────────────────────────
+# Feature definitions
+# ──────────────────────────────────────────────────────────────────────
+features:
+  basic_stats:
+    columns:
+      - n
+      - median
+      - wmean
+      - chi2red
+      - roms
+      - wstd
+      - norm_peak_to_peak_amp
+      - norm_excess_var
+      - median_abs_dev
+      - iqr
+      - i60r
+      - i70r
+      - i80r
+      - i90r
+      - skew
+      - smallkurt
+      - inv_vonneumannratio
+      - welch_i
+      - stetson_j
+      - stetson_k
+      - ad
+      - sw
+
+  best_period:
+    columns:
+      - period_LS
+      - period_CE
+      - period_AOV
+      - period_FPW
+      - significance_LS
+      - significance_CE
+      - significance_AOV
+      - significance_FPW
+
+  agreement:
+    columns:
+      - agree_score
+      - agree_strict
+      - agree_weighted
+      - best_agree_period
+      - best_consensus_period
+      - n_agree_pairs
+      - n_total_pairs
+
+  top5_periods:
+    columns:
+      - period_1_LS
+      - period_1_CE
+      - period_1_AOV
+      - period_1_FPW
+      - significance_1_LS
+      - significance_1_CE
+      - significance_1_AOV
+      - significance_1_FPW
+      - period_2_LS
+      - period_2_CE
+      - period_2_AOV
+      - period_2_FPW
+      - significance_2_LS
+      - significance_2_CE
+      - significance_2_AOV
+      - significance_2_FPW
+      - period_3_LS
+      - period_3_CE
+      - period_3_AOV
+      - period_3_FPW
+      - significance_3_LS
+      - significance_3_CE
+      - significance_3_AOV
+      - significance_3_FPW
+      - period_4_LS
+      - period_4_CE
+      - period_4_AOV
+      - period_4_FPW
+      - significance_4_LS
+      - significance_4_CE
+      - significance_4_AOV
+      - significance_4_FPW
+      - period_5_LS
+      - period_5_CE
+      - period_5_AOV
+      - period_5_FPW
+      - significance_5_LS
+      - significance_5_CE
+      - significance_5_AOV
+      - significance_5_FPW
+
+  fourier:
+    columns:
+      - f1_power_LS
+      - f1_power_CE
+      - f1_power_AOV
+      - f1_power_FPW
+      - f1_BIC_LS
+      - f1_BIC_CE
+      - f1_BIC_AOV
+      - f1_BIC_FPW
+      - f1_amp_LS
+      - f1_amp_CE
+      - f1_amp_AOV
+      - f1_amp_FPW
+      - f1_a_LS
+      - f1_a_CE
+      - f1_a_AOV
+      - f1_a_FPW
+      - f1_b_LS
+      - f1_b_CE
+      - f1_b_AOV
+      - f1_b_FPW
+      - f1_phi0_LS
+      - f1_phi0_CE
+      - f1_phi0_AOV
+      - f1_phi0_FPW
+      - f1_relamp1_LS
+      - f1_relamp1_CE
+      - f1_relamp1_AOV
+      - f1_relamp1_FPW
+      - f1_relamp2_LS
+      - f1_relamp2_CE
+      - f1_relamp2_AOV
+      - f1_relamp2_FPW
+      - f1_relamp3_LS
+      - f1_relamp3_CE
+      - f1_relamp3_AOV
+      - f1_relamp3_FPW
+      - f1_relamp4_LS
+      - f1_relamp4_CE
+      - f1_relamp4_AOV
+      - f1_relamp4_FPW
+      - f1_relphi1_LS
+      - f1_relphi1_CE
+      - f1_relphi1_AOV
+      - f1_relphi1_FPW
+      - f1_relphi2_LS
+      - f1_relphi2_CE
+      - f1_relphi2_AOV
+      - f1_relphi2_FPW
+      - f1_relphi3_LS
+      - f1_relphi3_CE
+      - f1_relphi3_AOV
+      - f1_relphi3_FPW
+      - f1_relphi4_LS
+      - f1_relphi4_CE
+      - f1_relphi4_AOV
+      - f1_relphi4_FPW
+
+  cross_catalog:
+    # These have significant NaN rates; filled with 0 after normalization.
+    # At Rubin inference time, ALL of these will be missing.
+    columns:
+      - AllWISE__w1mpro
+      - AllWISE__w2mpro
+      - AllWISE__w3mpro
+      - AllWISE__w4mpro
+      - Gaia_EDR3__parallax
+      - Gaia_EDR3__phot_g_mean_mag
+      - Gaia_EDR3__phot_bp_mean_mag
+      - Gaia_EDR3__phot_rp_mean_mag
+      - Gaia_EDR3__phot_bp_rp_excess_factor
+      - PS1_DR1__gMeanPSFMag
+      - PS1_DR1__rMeanPSFMag
+      - PS1_DR1__iMeanPSFMag
+      - PS1_DR1__zMeanPSFMag
+      - PS1_DR1__yMeanPSFMag
+
+  cadence:
+    columns:
+      - cad_probs_1
+      - cad_probs_10
+      - cad_probs_20
+      - cad_probs_30
+
+  ztf_specific:
+    # ZTF-only features; will be missing at Rubin inference time
+    columns:
+      - n_ztf_alerts
+      - mean_ztf_alert_braai
+
+# ──────────────────────────────────────────────────────────────────────
+# Model hyperparameters
+# ──────────────────────────────────────────────────────────────────────
+model:
+  backbone_dims: [256, 128, 64]
+  dropout: [0.3, 0.3, 0.2]
+  batch_norm: true
+
+training:
+  epochs: 100
+  batch_size: 512
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  lr_scheduler: cosine
+  warmup_epochs: 5
+  val_fraction: 0.15
+  label_threshold: 0.5
+  early_stopping_patience: 15
+
+  # Per-head loss weights (relative).  Set to 0 to disable a head.
+  head_weights:
+    vnv: 1.0
+    pnp: 1.0
+    morphology: 1.0
+    nonperiodic_type: 1.0
+    eclipsing_subtype: 1.0
+    sinusoidal_subtype: 1.0
+    sawtooth_subtype: 1.0
+    bogus: 0.5
+    wrong_period: 0.5
