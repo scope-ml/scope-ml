@@ -25,7 +25,7 @@ Notes on the faithful port
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -35,8 +35,13 @@ import torch.nn.functional as F
 class DenseBlock(nn.Module):
     """Keras-style repeated Dense layer block."""
 
-    def __init__(self, in_features: int, units: int,
-                 repetitions: int = 1, activation: str = "relu"):
+    def __init__(
+        self,
+        in_features: int,
+        units: int,
+        repetitions: int = 1,
+        activation: str = "relu",
+    ):
         super().__init__()
         self.activation_name = activation
         layers = []
@@ -65,12 +70,19 @@ class DenseBlock(nn.Module):
 class SeparableConv2d(nn.Module):
     """Keras-style SeparableConv2D = depthwise + pointwise conv."""
 
-    def __init__(self, in_channels: int, out_channels: int,
-                 kernel_size: int, stride: int = 1):
+    def __init__(
+        self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1
+    ):
         super().__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size,
-                                    stride=stride, padding=0,
-                                    groups=in_channels, bias=False)
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size,
+            stride=stride,
+            padding=0,
+            groups=in_channels,
+            bias=False,
+        )
         self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -80,9 +92,15 @@ class SeparableConv2d(nn.Module):
 class ConvBlock(nn.Module):
     """Keras-style repeated SeparableConv block + MaxPool."""
 
-    def __init__(self, in_channels: int, filters: int, kernel_size: int,
-                 pool_size: int = 2, repetitions: int = 1,
-                 activation: str = "relu"):
+    def __init__(
+        self,
+        in_channels: int,
+        filters: int,
+        kernel_size: int,
+        pool_size: int = 2,
+        repetitions: int = 1,
+        activation: str = "relu",
+    ):
         super().__init__()
         self.activation_name = activation
         self.convs = nn.ModuleList()
@@ -188,7 +206,7 @@ def load_keras_weights(model: ScopeNet, keras_h5_path: str) -> None:
     or inspect mismatches.
     """
     try:
-        import h5py
+        import h5py  # noqa: F401  (will be used when weight translation is implemented)
     except ImportError as e:
         raise ImportError("h5py required to load Keras weights") from e
 

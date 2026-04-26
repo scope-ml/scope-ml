@@ -37,11 +37,14 @@ Design notes
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    import numpy as np  # noqa: F401  (used in string type hints below)
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +92,13 @@ class EventTransformer(nn.Module):
         self.time2vec = Time2Vec(d_model)
         self.cls_tok = nn.Parameter(torch.zeros(1, 1, d_model))
         enc_layer = nn.TransformerEncoderLayer(
-            d_model, n_heads, d_model * 4, dropout, batch_first=True,
-            activation="gelu", norm_first=True,
+            d_model,
+            n_heads,
+            d_model * 4,
+            dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, n_layers)
         self.norm = nn.LayerNorm(d_model)
@@ -170,13 +178,21 @@ class AppleCiderClassifier(nn.Module):
         self.use_folded = use_folded
 
         self.event_enc = EventTransformer(
-            n_event_channels, d_model, n_heads, n_layers, dropout,
+            n_event_channels,
+            d_model,
+            n_heads,
+            n_layers,
+            dropout,
         )
         self.scalar_mlp = ScalarMLP(n_scalar, d_model, dropout)
         branches = 2  # event + scalar
         if use_folded:
             self.folded_enc = EventTransformer(
-                n_event_channels, d_model, n_heads, n_layers, dropout,
+                n_event_channels,
+                d_model,
+                n_heads,
+                n_layers,
+                dropout,
             )
             branches = 3
 
@@ -210,7 +226,8 @@ class AppleCiderClassifier(nn.Module):
         parts = [event_cls, scalar_vec]
         if self.use_folded:
             folded_cls = self.folded_enc(
-                inputs["folded_events"], inputs["folded_mask"],
+                inputs["folded_events"],
+                inputs["folded_mask"],
             )
             # Gate by period quality so aperiodic sources silence this branch
             gate = inputs["period_quality"].view(-1, 1)
@@ -269,8 +286,12 @@ if __name__ == "__main__":
     B, L, n_scalar = 4, 500, 47
     n_classes = 45
     model = AppleCiderClassifier(
-        n_classes=n_classes, n_scalar=n_scalar, d_model=64,
-        n_heads=4, n_layers=3, use_folded=False,
+        n_classes=n_classes,
+        n_scalar=n_scalar,
+        d_model=64,
+        n_heads=4,
+        n_layers=3,
+        use_folded=False,
     )
     inp = {
         "events": torch.randn(B, L, 6),
@@ -278,4 +299,6 @@ if __name__ == "__main__":
         "scalars": torch.randn(B, n_scalar),
     }
     out = model(inp)
-    print(f"logits: {out.shape}, params: {sum(p.numel() for p in model.parameters()):,}")
+    print(
+        f"logits: {out.shape}, params: {sum(p.numel() for p in model.parameters()):,}"
+    )

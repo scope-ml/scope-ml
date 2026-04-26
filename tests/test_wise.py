@@ -14,7 +14,6 @@ import pytest
 
 from scope.surveys.wise import (
     DEFAULT_BAND_MAP,
-    DEFAULT_QUALITY,
     IRSA_TAP_URL,
     JD_MINUS_MJD,
     WISELocalClient,
@@ -32,22 +31,23 @@ from scope.surveys.wise import (
 @pytest.fixture
 def sample_detections():
     """Synthetic NEOWISE-R detections mimicking the real table schema."""
-    n = 6
-    return pd.DataFrame({
-        "source_name": ["J000000.00+000000.0"] * 3 + ["J010000.00+100000.0"] * 3,
-        "ra": [0.0, 0.0, 0.0, 15.0, 15.0, 15.0],
-        "dec": [0.0, 0.0, 0.0, 10.0, 10.0, 10.0],
-        "mjd": np.array([56700.0, 56880.0, 57060.0, 56700.5, 56880.5, 57060.5]),
-        "w1mpro": np.array([14.0, 14.1, 13.9, 12.0, 12.2, 12.1]),
-        "w1sigmpro": np.array([0.05, 0.05, 0.05, 0.03, 0.03, 0.03]),
-        "w2mpro": np.array([13.5, 13.6, 13.4, 11.5, 11.7, 11.6]),
-        "w2sigmpro": np.array([0.06, 0.06, 0.06, 0.04, 0.04, 0.04]),
-        "cc_flags": ["0000", "0000", "h000", "0000", "0000", "0000"],
-        "ph_qual": ["AA", "AA", "AA", "AA", "AB", "BA"],
-        "qi_fact": [1.0, 1.0, 1.0, 0.6, 0.8, 0.3],
-        "moon_masked": ["00", "00", "00", "00", "00", "00"],
-        "saa_sep": [20.0, 20.0, 20.0, 50.0, 50.0, 50.0],
-    })
+    return pd.DataFrame(
+        {
+            "source_name": ["J000000.00+000000.0"] * 3 + ["J010000.00+100000.0"] * 3,
+            "ra": [0.0, 0.0, 0.0, 15.0, 15.0, 15.0],
+            "dec": [0.0, 0.0, 0.0, 10.0, 10.0, 10.0],
+            "mjd": np.array([56700.0, 56880.0, 57060.0, 56700.5, 56880.5, 57060.5]),
+            "w1mpro": np.array([14.0, 14.1, 13.9, 12.0, 12.2, 12.1]),
+            "w1sigmpro": np.array([0.05, 0.05, 0.05, 0.03, 0.03, 0.03]),
+            "w2mpro": np.array([13.5, 13.6, 13.4, 11.5, 11.7, 11.6]),
+            "w2sigmpro": np.array([0.06, 0.06, 0.06, 0.04, 0.04, 0.04]),
+            "cc_flags": ["0000", "0000", "h000", "0000", "0000", "0000"],
+            "ph_qual": ["AA", "AA", "AA", "AA", "AB", "BA"],
+            "qi_fact": [1.0, 1.0, 1.0, 0.6, 0.8, 0.3],
+            "moon_masked": ["00", "00", "00", "00", "00", "00"],
+            "saa_sep": [20.0, 20.0, 20.0, 50.0, 50.0, 50.0],
+        }
+    )
 
 
 @pytest.fixture
@@ -143,7 +143,13 @@ class TestFormatAsKowalski:
         # 2 sources × 2 bands (W1, W2) = 4 band-LCs
         assert len(out) == 4
         for entry in out:
-            assert set(entry.keys()) >= {"_id", "filter", "data", "source_id", "band_name"}
+            assert set(entry.keys()) >= {
+                "_id",
+                "filter",
+                "data",
+                "source_id",
+                "band_name",
+            }
 
     def test_filter_ids_match_band_map(self, sample_detections):
         out = _format_as_kowalski(sample_detections)
@@ -165,14 +171,18 @@ class TestFormatAsKowalski:
         assert np.isclose(first_entry["data"][0]["hjd"], mjd_expected + JD_MINUS_MJD)
 
     def test_nan_magnitudes_dropped(self):
-        df = pd.DataFrame({
-            "source_name": ["s1"] * 3,
-            "ra": [0.0] * 3, "dec": [0.0] * 3, "mjd": [1.0, 2.0, 3.0],
-            "w1mpro": [14.0, np.nan, 14.1],
-            "w1sigmpro": [0.05, 0.05, 0.05],
-            "w2mpro": [13.5, 13.6, 13.4],
-            "w2sigmpro": [0.06, 0.06, 0.06],
-        })
+        df = pd.DataFrame(
+            {
+                "source_name": ["s1"] * 3,
+                "ra": [0.0] * 3,
+                "dec": [0.0] * 3,
+                "mjd": [1.0, 2.0, 3.0],
+                "w1mpro": [14.0, np.nan, 14.1],
+                "w1sigmpro": [0.05, 0.05, 0.05],
+                "w2mpro": [13.5, 13.6, 13.4],
+                "w2sigmpro": [0.06, 0.06, 0.06],
+            }
+        )
         out = _format_as_kowalski(df, bands=("W1",))
         # NaN magnitude dropped; 2 points survive
         assert len(out) == 1 and len(out[0]["data"]) == 2
@@ -248,6 +258,7 @@ class TestMakeWiseClient:
         # We can't easily unload pyvo, so just assert the call doesn't crash
         # and returns either a TAP client or None.
         from scope.surveys.wise import WISETAPClient, HAS_PYVO
+
         client = make_wise_client(None)
         if HAS_PYVO:
             assert isinstance(client, WISETAPClient)
@@ -267,6 +278,7 @@ class TestIntegrationIRSA:
 
     def test_cone_query(self):
         from scope.surveys.wise import WISETAPClient
+
         client = WISETAPClient()
         df = client.get_objects_by_cone(ra=270.0, dec=66.5, radius_arcsec=10.0)
         assert len(df) > 0

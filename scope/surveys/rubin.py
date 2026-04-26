@@ -656,9 +656,7 @@ class RubinLocalDiaClient:
 
         # Visit table is small (~203 KB), load eagerly
         visit_path = os.path.join(data_path, "Visit.parquet.gzip")
-        self._visit_df = pd.read_parquet(
-            visit_path, columns=["visit", "expMidptMJD"]
-        )
+        self._visit_df = pd.read_parquet(visit_path, columns=["visit", "expMidptMJD"])
 
         # Lazy-loaded caches
         self._obj_ids = None
@@ -697,9 +695,7 @@ class RubinLocalDiaClient:
 
         import pandas as pd
 
-        fs_path = os.path.join(
-            self.data_path, "ForcedSourceOnDiaObject.parquet.gzip"
-        )
+        fs_path = os.path.join(self.data_path, "ForcedSourceOnDiaObject.parquet.gzip")
         fs_df = pd.read_parquet(
             fs_path,
             columns=[
@@ -825,9 +821,7 @@ class RubinLocalDiaClient:
 
         # Use searchsorted for efficient lookup
         oid_set = set(int(oid) for oid in objectids)
-        left_indices = np.searchsorted(
-            self._fs_object_ids, list(oid_set), side="left"
-        )
+        left_indices = np.searchsorted(self._fs_object_ids, list(oid_set), side="left")
         right_indices = np.searchsorted(
             self._fs_object_ids, list(oid_set), side="right"
         )
@@ -891,9 +885,7 @@ class RubinLocalDiaClient:
 
         return result
 
-    def get_lightcurves_for_cone(
-        self, ra, dec, radius_arcsec, bands=None, limit=10000
-    ):
+    def get_lightcurves_for_cone(self, ra, dec, radius_arcsec, bands=None, limit=10000):
         """
         Convenience method: cone search + lightcurve retrieval in one call.
 

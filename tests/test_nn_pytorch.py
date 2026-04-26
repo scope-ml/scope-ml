@@ -5,12 +5,11 @@ Unit tests (no GPU needed) cover layer arithmetic, forward shapes,
 training-loop integration, and layout options.
 """
 
-import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from scope.nn_pytorch import (
+from scope.nn_pytorch import (  # noqa: E402  (after importorskip)
     ConvBlock,
     DenseBlock,
     ScopeNet,

@@ -25,12 +25,13 @@ from __future__ import annotations
 import os
 import time
 import warnings
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
 try:
     import pyvo  # type: ignore
+
     HAS_PYVO = True
 except ImportError:
     HAS_PYVO = False
@@ -79,11 +80,13 @@ WISE_CADENCE_FUNDAMENTAL_DAYS = 180.0
 WISE_SIDEREAL_YEAR_DAYS = 365.25
 
 
-def _generate_rational_aliases(fundamental_days: float,
-                                 max_numerator: int = 3,
-                                 max_denominator: int = 8,
-                                 p_min_days: float = 15.0,
-                                 p_max_days: float = 700.0) -> tuple:
+def _generate_rational_aliases(
+    fundamental_days: float,
+    max_numerator: int = 3,
+    max_denominator: int = 8,
+    p_min_days: float = 15.0,
+    p_max_days: float = 700.0,
+) -> tuple:
     """Return a sorted tuple of P = fundamental × k/n for small integer k, n,
     clipped to ``[p_min_days, p_max_days]``."""
     periods = set()
@@ -96,11 +99,16 @@ def _generate_rational_aliases(fundamental_days: float,
 
 
 WISE_CADENCE_ALIAS_PERIODS_DAYS = tuple(
-    list(_generate_rational_aliases(
-        WISE_CADENCE_FUNDAMENTAL_DAYS,
-        max_numerator=3, max_denominator=8,
-        p_min_days=15.0, p_max_days=700.0,
-    )) + [WISE_SIDEREAL_YEAR_DAYS]
+    list(
+        _generate_rational_aliases(
+            WISE_CADENCE_FUNDAMENTAL_DAYS,
+            max_numerator=3,
+            max_denominator=8,
+            p_min_days=15.0,
+            p_max_days=700.0,
+        )
+    )
+    + [WISE_SIDEREAL_YEAR_DAYS]
 )
 """Tuple of WISE cadence alias periods (in days).
 
@@ -126,15 +134,15 @@ def _quality_mask(df, quality: Dict[str, Any] = None) -> np.ndarray:
     q = {**DEFAULT_QUALITY, **(quality or {})}
     mask = np.ones(len(df), dtype=bool)
     if "cc_flags" in df.columns:
-        mask &= (df["cc_flags"].astype(str) == q["cc_flags"])
+        mask &= df["cc_flags"].astype(str) == q["cc_flags"]
     if "ph_qual" in df.columns:
         mask &= df["ph_qual"].isin(q["ph_qual_allowed"])
     if "qi_fact" in df.columns:
-        mask &= (df["qi_fact"] > q["qi_fact_min"])
+        mask &= df["qi_fact"] > q["qi_fact_min"]
     if "moon_masked" in df.columns:
-        mask &= (df["moon_masked"].astype(str) == q["moon_masked"])
+        mask &= df["moon_masked"].astype(str) == q["moon_masked"]
     if "saa_sep" in df.columns:
-        mask &= (df["saa_sep"] > q["saa_sep_min"])
+        mask &= df["saa_sep"] > q["saa_sep_min"]
     return mask
 
 
@@ -211,13 +219,15 @@ def _format_as_kowalski(
                 }
                 for k in np.where(valid)[0]
             ]
-            out.append({
-                "_id": f"{src_id}_{band}",
-                "filter": band_map[band],
-                "data": data,
-                "source_id": src_id,
-                "band_name": band,
-            })
+            out.append(
+                {
+                    "_id": f"{src_id}_{band}",
+                    "filter": band_map[band],
+                    "data": data,
+                    "source_id": src_id,
+                    "band_name": band,
+                }
+            )
     return out
 
 
@@ -250,8 +260,13 @@ class WISETAPClient:
     # ------------------------------------------------------------------
     # Query helpers
     # ------------------------------------------------------------------
-    def _submit_async(self, adql: str, uploads: Optional[dict] = None, poll: float = 15.0,
-                      timeout_sec: float = 14400.0):
+    def _submit_async(
+        self,
+        adql: str,
+        uploads: Optional[dict] = None,
+        poll: float = 15.0,
+        timeout_sec: float = 14400.0,
+    ):
         """Submit ADQL as an async TAP job, poll, return the fetched table as a
         pandas DataFrame. Retries a handful of times on known flaky responses
         (base-URL-only returns from IRSA)."""
@@ -259,7 +274,11 @@ class WISETAPClient:
         # Retry up to 5 times on that pathology.
         job = None
         for _ in range(5):
-            job = self.tap.submit_job(adql, uploads=uploads) if uploads else self.tap.submit_job(adql)
+            job = (
+                self.tap.submit_job(adql, uploads=uploads)
+                if uploads
+                else self.tap.submit_job(adql)
+            )
             url = job.url
             if "/async/" in url and not url.rstrip("/").endswith("/async"):
                 break
@@ -269,7 +288,9 @@ class WISETAPClient:
                 pass
             time.sleep(10)
         else:
-            raise RuntimeError(f"IRSA TAP never returned a job-specific URL (last: {job.url!r})")
+            raise RuntimeError(
+                f"IRSA TAP never returned a job-specific URL (last: {job.url!r})"
+            )
 
         job.run()
         t0 = time.time()
@@ -277,7 +298,9 @@ class WISETAPClient:
         while job.phase in ("QUEUED", "EXECUTING", "PENDING"):
             time.sleep(p)
             if time.time() - t0 > timeout_sec:
-                raise TimeoutError(f"TAP job still {job.phase} after {timeout_sec:.0f}s")
+                raise TimeoutError(
+                    f"TAP job still {job.phase} after {timeout_sec:.0f}s"
+                )
             p = min(p * 1.2, 60.0)
         if job.phase != "COMPLETED":
             raise RuntimeError(f"TAP job failed with phase {job.phase}")
@@ -341,8 +364,9 @@ class WISETAPClient:
         rows = self._submit_async(adql, uploads={"usercat": tbl})
         # Apply quality cuts, then format
         mask = _quality_mask(rows, self.quality)
-        return _format_as_kowalski(rows[mask], id_col="source_name",
-                                    band_map=self.band_map, bands=bands)
+        return _format_as_kowalski(
+            rows[mask], id_col="source_name", band_map=self.band_map, bands=bands
+        )
 
     def get_lightcurves_for_cone(
         self,
@@ -366,8 +390,10 @@ class WISETAPClient:
 
     def get_detections_by_ecliptic_cell(
         self,
-        elat_lo: float, elat_hi: float,
-        elon_lo: float, elon_hi: float,
+        elat_lo: float,
+        elat_hi: float,
+        elon_lo: float,
+        elon_hi: float,
         w1snr_min: float = 3.0,
     ):
         """Bulk-fetch raw NEOWISE-R detections in an ecliptic (lat, lon) cell.
@@ -428,12 +454,15 @@ class WISELocalClient:
         self.band_map = band_map if band_map is not None else dict(DEFAULT_BAND_MAP)
         self._is_combined = os.path.isfile(data_path) and data_path.endswith(".parquet")
         if not self._is_combined and not os.path.isdir(data_path):
-            raise FileNotFoundError(f"data_path {data_path!r} is neither a parquet file nor a directory")
+            raise FileNotFoundError(
+                f"data_path {data_path!r} is neither a parquet file nor a directory"
+            )
         self._sources_df = None  # lazy-loaded CatWISE source list
 
     # ------------------------------------------------------------------
     def _load_sources(self):
         import pandas as pd  # lazy import
+
         if self._sources_df is not None:
             return self._sources_df
         if self._is_combined:
@@ -443,15 +472,21 @@ class WISELocalClient:
             self._sources_df = df.drop_duplicates("source_name").reset_index(drop=True)
         else:
             if self.catwise_source_list is None:
-                raise ValueError("catwise_source_list is required when data_path is a directory")
-            self._sources_df = pd.read_parquet(self.catwise_source_list,
-                                               columns=["source_name", "ra", "dec"])
+                raise ValueError(
+                    "catwise_source_list is required when data_path is a directory"
+                )
+            self._sources_df = pd.read_parquet(
+                self.catwise_source_list, columns=["source_name", "ra", "dec"]
+            )
         return self._sources_df
 
     # ------------------------------------------------------------------
-    def get_objects_by_cone(self, ra: float, dec: float, radius_arcsec: float, limit: int = 10000):
+    def get_objects_by_cone(
+        self, ra: float, dec: float, radius_arcsec: float, limit: int = 10000
+    ):
         """Return CatWISE-like rows within a cone, from the local source list."""
         import pandas as pd  # noqa: F401 — triggers pandas availability error cleanly if missing
+
         sources = self._load_sources()
         # Small-angle approximation: OK for |β|>85 where everything is near the pole,
         # but use proper angular separation for correctness.
@@ -473,7 +508,6 @@ class WISELocalClient:
         bands: Sequence[str] = ("W1", "W2"),
     ):
         """Return Kowalski-format LCs for a list of CatWISE source names."""
-        import pandas as pd  # lazy
         import pyarrow as pa  # lazy
         import pyarrow.compute as pc
         import pyarrow.dataset as pds
@@ -483,25 +517,39 @@ class WISELocalClient:
             ds = pds.dataset(self.data_path, format="parquet")
         else:
             files = sorted(
-                f for f in os.listdir(self.data_path)
+                f
+                for f in os.listdir(self.data_path)
                 if f.startswith("cell_") and f.endswith(".parquet")
             )
             if not files:
                 raise FileNotFoundError(f"No cell_*.parquet under {self.data_path}")
-            ds = pds.dataset([os.path.join(self.data_path, f) for f in files], format="parquet")
+            ds = pds.dataset(
+                [os.path.join(self.data_path, f) for f in files], format="parquet"
+            )
 
         sn_type = ds.schema.field("source_name").type
         pa_set = pa.array(source_ids, type=sn_type)
         filt = pc.is_in(pds.field("source_name"), value_set=pa_set)
-        cols = ["source_name", "mjd", "w1mpro", "w1sigmpro", "w2mpro", "w2sigmpro",
-                "cc_flags", "ph_qual", "qi_fact", "moon_masked"]
+        cols = [
+            "source_name",
+            "mjd",
+            "w1mpro",
+            "w1sigmpro",
+            "w2mpro",
+            "w2sigmpro",
+            "cc_flags",
+            "ph_qual",
+            "qi_fact",
+            "moon_masked",
+        ]
         # Drop columns that don't exist in this particular schema
         cols = [c for c in cols if c in ds.schema.names]
         tbl = ds.to_table(columns=cols, filter=filt)
         df = tbl.to_pandas()
         mask = _quality_mask(df)
-        return _format_as_kowalski(df[mask], id_col="source_name",
-                                    band_map=self.band_map, bands=bands)
+        return _format_as_kowalski(
+            df[mask], id_col="source_name", band_map=self.band_map, bands=bands
+        )
 
     def get_lightcurves_for_cone(
         self,
@@ -541,7 +589,9 @@ def make_wise_client(
     """
     wise_cfg = (config or {}).get("wise", {})
     local_path = wise_cfg.get("data_path") or os.environ.get("WISE_DATA_PATH")
-    catwise_list = wise_cfg.get("catwise_source_list") or os.environ.get("WISE_CATWISE_LIST")
+    catwise_list = wise_cfg.get("catwise_source_list") or os.environ.get(
+        "WISE_CATWISE_LIST"
+    )
 
     # Local-cache path wins on offline nodes
     if local_path:
@@ -561,7 +611,9 @@ def make_wise_client(
 
     # Fall through to TAP
     if not HAS_PYVO:
-        warnings.warn("pyvo not installed and no WISE local cache — WISE access unavailable")
+        warnings.warn(
+            "pyvo not installed and no WISE local cache — WISE access unavailable"
+        )
         return None
     return WISETAPClient(
         tap_url=wise_cfg.get("tap_url", IRSA_TAP_URL),

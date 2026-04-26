@@ -177,9 +177,7 @@ class HierarchicalClassifier:
         self.quality_flags: list[str] = []
         if qf_key in tax:
             self.quality_flags = list(tax[qf_key].keys())
-            self._qf_columns = {
-                k: v["label_columns"] for k, v in tax[qf_key].items()
-            }
+            self._qf_columns = {k: v["label_columns"] for k, v in tax[qf_key].items()}
 
         # Model / normalization state (set during train or load)
         self.model: Optional[HierarchicalNet] = None
@@ -194,8 +192,11 @@ class HierarchicalClassifier:
         """Pull feature columns, fill NaN with 0, return float32 array."""
         missing = [c for c in self.feature_columns if c not in df.columns]
         if missing:
-            log.warning("Missing %d feature columns, filling with NaN: %s",
-                        len(missing), missing[:10])
+            log.warning(
+                "Missing %d feature columns, filling with NaN: %s",
+                len(missing),
+                missing[:10],
+            )
         X = np.zeros((len(df), len(self.feature_columns)), dtype=np.float32)
         for i, col in enumerate(self.feature_columns):
             if col in df.columns:
@@ -239,9 +240,7 @@ class HierarchicalClassifier:
                     continue
                 for col in cols:
                     if col in df.columns:
-                        vals = pd.to_numeric(
-                            df[col], errors="coerce"
-                        ).fillna(0).values
+                        vals = pd.to_numeric(df[col], errors="coerce").fillna(0).values
                         scores[:, ci] = np.maximum(scores[:, ci], vals)
             node_scores[name] = scores
 
@@ -268,7 +267,6 @@ class HierarchicalClassifier:
         for name, node in self.nodes.items():
             scores = node_scores[name]
             winner = scores.argmax(axis=1)
-            has_any = scores.max(axis=1) >= threshold
             labels[name] = winner
             # For the "remainder" class pattern (e.g., other_sawtooth),
             # if no class reaches threshold but the source is in this
@@ -381,7 +379,8 @@ class HierarchicalClassifier:
         n_val = int(len(full_ds) * val_fraction)
         n_train = len(full_ds) - n_val
         train_ds, val_ds = random_split(
-            full_ds, [n_train, n_val],
+            full_ds,
+            [n_train, n_val],
             generator=torch.Generator().manual_seed(42),
         )
         train_loader = DataLoader(
@@ -429,7 +428,11 @@ class HierarchicalClassifier:
 
         log.info(
             "Training: %d epochs, lr=%.1e, batch=%d, train=%d, val=%d",
-            epochs, lr, batch_size, n_train, n_val,
+            epochs,
+            lr,
+            batch_size,
+            n_train,
+            n_val,
         )
 
         for epoch in range(epochs):
@@ -471,19 +474,26 @@ class HierarchicalClassifier:
             if (epoch + 1) % 5 == 0 or epoch == 0:
                 log.info(
                     "Epoch %3d/%d  train_loss=%.4f  val_loss=%.4f  lr=%.2e",
-                    epoch + 1, epochs, train_loss, val_loss,
+                    epoch + 1,
+                    epochs,
+                    train_loss,
+                    val_loss,
                     scheduler.get_last_lr()[0],
                 )
 
             # Early stopping
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                best_state = {
+                    k: v.cpu().clone() for k, v in self.model.state_dict().items()
+                }
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= patience:
-                    log.info("Early stopping at epoch %d (patience=%d)", epoch + 1, patience)
+                    log.info(
+                        "Early stopping at epoch %d (patience=%d)", epoch + 1, patience
+                    )
                     break
 
         # Restore best weights
@@ -495,7 +505,12 @@ class HierarchicalClassifier:
         metrics = self.evaluate_loader(val_loader)
         log.info("Final validation metrics:")
         for node_name, m in metrics.items():
-            log.info("  %s: acc=%.3f  bal_acc=%.3f", node_name, m["accuracy"], m["balanced_accuracy"])
+            log.info(
+                "  %s: acc=%.3f  bal_acc=%.3f",
+                node_name,
+                m["accuracy"],
+                m["balanced_accuracy"],
+            )
 
         # Save if requested
         if output_dir:
@@ -648,9 +663,15 @@ class HierarchicalClassifier:
     def evaluate_loader(self, loader: DataLoader) -> dict[str, dict]:
         """Evaluate on a DataLoader, return per-node metrics."""
         self.model.eval()
-        all_labels: dict[str, list] = {n: [] for n in list(self.nodes) + self.quality_flags}
-        all_preds: dict[str, list] = {n: [] for n in list(self.nodes) + self.quality_flags}
-        all_masks: dict[str, list] = {n: [] for n in list(self.nodes) + self.quality_flags}
+        all_labels: dict[str, list] = {
+            n: [] for n in list(self.nodes) + self.quality_flags
+        }
+        all_preds: dict[str, list] = {
+            n: [] for n in list(self.nodes) + self.quality_flags
+        }
+        all_masks: dict[str, list] = {
+            n: [] for n in list(self.nodes) + self.quality_flags
+        }
 
         with torch.no_grad():
             for batch in loader:
@@ -666,7 +687,12 @@ class HierarchicalClassifier:
                     all_masks[name].append(msk)
 
                 for flag in self.quality_flags:
-                    pred = (torch.sigmoid(logits[flag]).squeeze(-1) >= 0.5).int().cpu().numpy()
+                    pred = (
+                        (torch.sigmoid(logits[flag]).squeeze(-1) >= 0.5)
+                        .int()
+                        .cpu()
+                        .numpy()
+                    )
                     lab = batch[f"label_{flag}"].numpy()
                     msk = batch[f"mask_{flag}"].numpy()
                     all_preds[flag].append(pred)
@@ -681,7 +707,11 @@ class HierarchicalClassifier:
 
             active = msk.astype(bool)
             if active.sum() == 0:
-                metrics[name] = {"accuracy": 0.0, "balanced_accuracy": 0.0, "n_active": 0}
+                metrics[name] = {
+                    "accuracy": 0.0,
+                    "balanced_accuracy": 0.0,
+                    "n_active": 0,
+                }
                 continue
 
             y_true = lab[active]
@@ -697,8 +727,11 @@ class HierarchicalClassifier:
 
             cm = confusion_matrix(y_true, y_pred)
             report = classification_report(
-                y_true, y_pred, target_names=target_names,
-                output_dict=True, zero_division=0,
+                y_true,
+                y_pred,
+                target_names=target_names,
+                output_dict=True,
+                zero_division=0,
             )
 
             metrics[name] = {
@@ -729,6 +762,7 @@ class HierarchicalClassifier:
         np.savez(path / "class_weights.npz", **cw)
         # Copy config
         import shutil
+
         shutil.copy2(self.config_path, path / "hierarchy_config.yaml")
         log.info("Model saved to %s", path)
 

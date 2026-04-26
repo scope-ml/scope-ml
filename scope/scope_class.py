@@ -5,7 +5,9 @@ import numpy as np
 import os
 import pandas as pd
 import pathlib
-from penquins import Kowalski  # noqa: F401 (retained for backward compatibility of imports from this module)
+
+# Re-export for backward compatibility of imports from this module.
+from penquins import Kowalski  # noqa: F401
 from scope.surveys.kowalski import make_kowalski_client
 import subprocess
 import sys
