@@ -20,8 +20,8 @@ from .utils import (
     write_parquet,
     parse_load_config,
 )
-from .fritz import radec_to_iau_name
-from .rubin import make_rubin_client, HAS_PYVO
+from .surveys.fritz import radec_to_iau_name
+from .surveys.rubin import make_rubin_client, HAS_PYVO
 import json
 import shutil
 import argparse
@@ -2502,7 +2502,7 @@ class Scope:
             inference,
             combine_preds,
         )
-        from .fritz import get_lightcurves_via_coords
+        from .surveys.fritz import get_lightcurves_via_coords
 
         # Test feature generation
         with status("Test generate_features"):
