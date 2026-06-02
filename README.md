@@ -124,6 +124,17 @@ Completed chunks are saved to `generated_features_rubin/chunks/` and skipped on 
 | `generate-features-rubin-slurm` | Generate a SLURM array job script from chunk files |
 | `combine-rubin-features` | Merge per-chunk parquet outputs into a single file |
 
+## Installing with periodfind
+
+To install SCoPe with periodfind, please complete periodfind GPU installation with Rust.
+Once that is done, you might encounter an issue in numpy version discrepancy between what SCoPe requires and what periodfind requires. SCoPe-ml 0.9.5 requires numpy<1.24,>=1.23 and periodfind might have installed a different version.
+You can make it work by installing SCoPe witout dependencies and then installing the dependencies one-by-one while skipping numpy.
+
+```bash
+pip install scope-ml --no-deps
+pip install deepdiff gsutil matplotlib questionary scikit-learn wandb h5py astropy fast-histogram healpy "jinja2<=3.1" pandas penquins pyyaml tdtax pyarrow "numba>=0.56.4" cesium xgboost seaborn pydot notebook cython "tables>=3.7,<3.9.2" pyvo
+```
+
 ## Funding
  We gratefully acknowledge previous and current support from the U.S. National Science Foundation (NSF) Harnessing the Data Revolution (HDR) Institute for <a href="https://a3d3.ai">Accelerated AI Algorithms for Data-Driven Discovery (A3D3)</a> under Cooperative Agreement No. <a href="https://www.nsf.gov/awardsearch/showAward?AWD_ID=2117997">PHY-2117997</a>.
 
