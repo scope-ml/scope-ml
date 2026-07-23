@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-PDRS: peak-detection region segmentation for flare / high-activity features.
+PDRS: peak-driven region segmentation for flare / high-activity features.
+
+Adapted from https://github.com/zerozole/Peak_Driven_Region_Segmentation
 
 Detects flare regions in a light curve by finding significant peaks in binned
 flux, growing each peak into a region using a gradient-guided expansion,
