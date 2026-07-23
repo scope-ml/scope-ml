@@ -27,7 +27,13 @@ import pandas as pd
 from astropy.coordinates import SkyCoord, angular_separation
 import astropy.units as u
 from datetime import datetime
-from tools.featureGeneration import periodsearch, alertstats, external_xmatch
+from tools.featureGeneration import (
+    periodsearch,
+    alertstats,
+    external_xmatch,
+    pdrs,
+    drw,
+)
 import warnings
 from cesium.featurize import time_series, featurize_single_ts
 import json
@@ -46,6 +52,8 @@ ext_catalog_info = config['feature_generation']['external_catalog_features']
 cesium_feature_list = config['feature_generation']['cesium_features']
 period_algorithms = config['feature_generation']['period_algorithms']
 path_to_features = config['feature_generation']['path_to_features']
+pdrs_params = config['feature_generation'].get('pdrs', {})
+drw_params = config['feature_generation'].get('drw', {})
 
 if path_to_features is not None:
     BASE_DIR = pathlib.Path(path_to_features)
@@ -510,6 +518,8 @@ def generate_features(
     dirname: str = 'generated_features',
     filename: str = 'gen_features',
     doCesium: bool = False,
+    doFlareDetection: bool = False,
+    doDRW: bool = False,
     doNotSave: bool = False,
     stop_early: bool = False,
     doQuadrantFile: bool = False,
@@ -553,6 +563,8 @@ def generate_features(
     :param dirname: name of generated feature directory (str)
     :param filename: prefix of each feature filename (str)
     :param doCesium: flag to compute config-specified cesium features in addition to default list (bool)
+    :param doFlareDetection: flag to compute PDRS flare/high-activity segmentation features (bool)
+    :param doDRW: flag to fit damped-random-walk models and compute DRW anomaly features (bool)
     :param doNotSave: flag to avoid saving generated features (bool)
     :param stop_early: flag to stop feature generation before entire quadrant is run. Pair with --limit to run small-scale tests (bool)
     :param doQuadrantFile: flag to use a generated file containing [jobID, field, ccd, quad] columns instead of specifying --field, --ccd and --quad (bool)
@@ -910,6 +922,23 @@ def generate_features(
     for idx, _id in enumerate(id_list_bs):
         for si, key in enumerate(stat_keys):
             feature_dict[_id][key] = float(basic_stats_arr[idx, si])
+
+    if doFlareDetection:
+        print(f'Computing PDRS flare features for {len(id_list_bs)} sources...')
+        for _id in id_list_bs:
+            feature_dict[_id].update(
+                pdrs.calc_pdrs_stats(tme_dict[_id]['tme'], **pdrs_params)
+            )
+
+    if doDRW:
+        print(f'Computing DRW features for {len(id_list_bs)} sources...')
+        drw_stats_list = drw.calc_drw_stats_batch(
+            [tme_dict[_id]['tme'] for _id in id_list_bs],
+            Ncore=Ncore,
+            **drw_params,
+        )
+        for _id, drw_stats in zip(id_list_bs, drw_stats_list):
+            feature_dict[_id].update(drw_stats)
 
     if baseline > 0:
         # Define frequency grid using largest LC time baseline
@@ -1594,6 +1623,18 @@ def get_parser(**kwargs):
         help="if set, use Cesium to generate additional features specified in config",
     )
     parser.add_argument(
+        "--doFlareDetection",
+        action='store_true',
+        default=False,
+        help="if set, compute PDRS flare/high-activity segmentation features",
+    )
+    parser.add_argument(
+        "--doDRW",
+        action='store_true',
+        default=False,
+        help="if set, fit damped-random-walk models and compute DRW anomaly features",
+    )
+    parser.add_argument(
         "--doNotSave",
         action='store_true',
         default=False,
@@ -1693,6 +1734,8 @@ def main():
         dirname=args.dirname,
         filename=args.filename,
         doCesium=args.doCesium,
+        doFlareDetection=args.doFlareDetection,
+        doDRW=args.doDRW,
         doNotSave=args.doNotSave,
         stop_early=args.stop_early,
         doQuadrantFile=args.doQuadrantFile,
