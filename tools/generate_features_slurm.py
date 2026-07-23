@@ -389,6 +389,8 @@ def main():
     dirname = args.dirname
     filename = args.filename
     doCesium = args.doCesium
+    doFlareDetection = args.doFlareDetection
+    doDRW = args.doDRW
     doNotSave = args.doNotSave
     stop_early = args.stop_early
     doSpecificIDs = args.doSpecificIDs
@@ -409,6 +411,10 @@ def main():
         extra_flags.append("--doRemoveTerrestrial")
     if doCesium:
         extra_flags.append("--doCesium")
+    if doFlareDetection:
+        extra_flags.append("--doFlareDetection")
+    if doDRW:
+        extra_flags.append("--doDRW")
     if doNotSave:
         extra_flags.append("--doNotSave")
     if stop_early:

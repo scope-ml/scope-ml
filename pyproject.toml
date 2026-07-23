@@ -51,6 +51,7 @@ notebook = ">=7.0.6"
 cython = ">=3.0.10"
 tables = ">=3.7,<3.9.2"
 pyvo = ">=1.5"
+celerite = ">=0.4.2"
 
 [tool.poetry.extras]
 train = ["tensorflow", "keras-tuner"]
@@ -93,3 +94,4 @@ get-rubin-ids = "tools.get_rubin_ids:main"
 generate-features-rubin = "tools.generate_features_rubin:main"
 run-scope-local = "tools.run_scope_local:main"
 analyze-logs = "tools.analyze_logs:main"
+evt-calibration = "tools.evt_calibration:main"

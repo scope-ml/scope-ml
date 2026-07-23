@@ -438,6 +438,14 @@ features:
       include: true
       dtype: float
       periodic: false
+    anomaly_flag:
+      include: false
+      dtype: Int64
+      periodic: false
+    anomaly_score:
+      include: false
+      dtype: float
+      periodic: false
     ccd:
       include: false
       dtype: Int64
@@ -447,6 +455,22 @@ features:
       dtype: float
       periodic: false
     dec:
+      include: false
+      dtype: float
+      periodic: false
+    drw_fit_success:
+      include: false
+      dtype: Int64
+      periodic: false
+    drw_max_z:
+      include: false
+      dtype: float
+      periodic: false
+    drw_sigma:
+      include: false
+      dtype: float
+      periodic: false
+    drw_tau:
       include: false
       dtype: float
       periodic: false
@@ -510,6 +534,14 @@ features:
       include: false
       dtype: Int64
       periodic: false
+    flare_duty_cycle:
+      include: false
+      dtype: float
+      periodic: false
+    flare_significance:
+      include: false
+      dtype: float
+      periodic: false
     i60r:
       include: true
       dtype: float
@@ -549,6 +581,10 @@ features:
     n:
       include: false
       dtype: float
+      periodic: false
+    n_flares:
+      include: false
+      dtype: Int64
       periodic: false
     n_ztf_alerts:
       include: false
@@ -624,6 +660,16 @@ features:
       dtype: float
       impute_strategy: None
       periodic: false
+    anomaly_flag:
+      include: false
+      dtype: Int64
+      impute_strategy: None
+      periodic: false
+    anomaly_score:
+      include: false
+      dtype: float
+      impute_strategy: None
+      periodic: false
     ccd:
       include: false
       dtype: Int64
@@ -635,6 +681,26 @@ features:
       impute_strategy: None
       periodic: false
     dec:
+      include: false
+      dtype: float
+      impute_strategy: None
+      periodic: false
+    drw_fit_success:
+      include: false
+      dtype: Int64
+      impute_strategy: None
+      periodic: false
+    drw_max_z:
+      include: false
+      dtype: float
+      impute_strategy: None
+      periodic: false
+    drw_sigma:
+      include: false
+      dtype: float
+      impute_strategy: None
+      periodic: false
+    drw_tau:
       include: false
       dtype: float
       impute_strategy: None
@@ -714,6 +780,16 @@ features:
       dtype: Int64
       impute_strategy: None
       periodic: false
+    flare_duty_cycle:
+      include: false
+      dtype: float
+      impute_strategy: None
+      periodic: false
+    flare_significance:
+      include: false
+      dtype: float
+      impute_strategy: None
+      periodic: false
     i60r:
       include: true
       dtype: float
@@ -762,6 +838,11 @@ features:
     n:
       include: false
       dtype: float
+      impute_strategy: None
+      periodic: false
+    n_flares:
+      include: false
+      dtype: Int64
       impute_strategy: None
       periodic: false
     n_ztf_alerts:
@@ -1489,6 +1570,25 @@ feature_stats:
 feature_generation:
   # Path to save generated features
   path_to_features:
+  # PDRS flare/high-activity segmentation parameters (--doFlareDetection), tuned for ZTF DR23
+  pdrs:
+    bin_size_days: 3.0
+    peak_threshold: 2.0
+    smooth_window: 7
+    min_cluster_size: 3
+    saddle_ratio: 0.2
+    region_threshold: 0.5
+    max_gap_days: 60.0
+  # Damped-random-walk fit parameters (--doDRW). max_iter: 1 is a single plain fit;
+  # max_iter > 1 iteratively masks |z| > z_thr outliers between refits
+  drw:
+    min_epochs: 15
+    max_iter: 1
+    z_thr: 3.0
+  # Extreme-value-theory calibration defaults (tools/evt_calibration.py)
+  evt:
+    pot_percentile: 95.0
+    p_target: 0.01
   # If --doSpecificIDs is set in generate_features.py, the script will generate features for the below dataset instead of a field/ccd/quad.
   # Dataset must contain columns named "ztf_id" and "coordinates" with data in the format of these fields on Kowalski
   # Default dataset is the training set downloadable from Fritz

@@ -24,3 +24,4 @@ scikit-learn>=0.24.1
 wandb>=0.16.6
 cython>=3.0.10
 pyvo>=1.5
+celerite>=0.4.2
