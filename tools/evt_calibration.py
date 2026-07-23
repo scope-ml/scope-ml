@@ -226,8 +226,7 @@ def main():
     per_filter = (not args.no_per_filter) and ('filter' in pooled.columns)
     if per_filter:
         groups = {
-            int(flt): grp['drw_max_z'].values
-            for flt, grp in pooled.groupby('filter')
+            int(flt): grp['drw_max_z'].values for flt, grp in pooled.groupby('filter')
         }
     else:
         groups = {'all': pooled['drw_max_z'].values}
@@ -293,9 +292,9 @@ def main():
             score[sel] = anomaly_score(z, calib)
             finite = np.isfinite(z)
             group_flag = np.full(z.shape, np.nan)
-            group_flag[finite] = (
-                z[finite] > calib['detection_threshold']
-            ).astype(float)
+            group_flag[finite] = (z[finite] > calib['detection_threshold']).astype(
+                float
+            )
             flag[sel] = group_flag
 
         df['anomaly_score'] = score

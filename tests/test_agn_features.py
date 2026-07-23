@@ -313,9 +313,7 @@ class TestEndToEnd:
         # Pad the population for a stable GPD fit using resampling with noise
         rng = np.random.default_rng(0)
         base = np.array(max_z_population)
-        pop = np.concatenate(
-            [base, rng.choice(base, 500) + rng.normal(0, 0.1, 500)]
-        )
+        pop = np.concatenate([base, rng.choice(base, 500) + rng.normal(0, 0.1, 500)])
 
         calib = evt.fit_gpd(pop, pot_percentile=90.0)
         thr = evt.detection_threshold(calib, p_target=0.01)

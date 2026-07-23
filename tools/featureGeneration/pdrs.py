@@ -149,37 +149,37 @@ def detect_flares(
 
             # Expand LEFT: rise phase (moving backward in time). Stop if the
             # point dips below the global median or the gap exceeds max_gap.
-            l = frontiers[p]['left']
+            left = frontiers[p]['left']
             if (
-                l > 0
-                and assignments[l - 1] == -1
-                and flux[l - 1] >= median_f
-                and (mjd[l] - mjd[l - 1]) <= max_gap
+                left > 0
+                and assignments[left - 1] == -1
+                and flux[left - 1] >= median_f
+                and (mjd[left] - mjd[left - 1]) <= max_gap
             ):
-                if flux[l - 1] < flux[l]:
-                    assignments[l - 1] = p
-                    frontiers[p]['left'] = l - 1
+                if flux[left - 1] < flux[left]:
+                    assignments[left - 1] = p
+                    frontiers[p]['left'] = left - 1
                     expanded = True
-                elif grad[l] >= 0:
-                    assignments[l - 1] = p
-                    frontiers[p]['left'] = l - 1
+                elif grad[left] >= 0:
+                    assignments[left - 1] = p
+                    frontiers[p]['left'] = left - 1
                     expanded = True
 
             # Expand RIGHT: decay phase (moving forward in time)
-            r = frontiers[p]['right']
+            right = frontiers[p]['right']
             if (
-                r < n_points - 1
-                and assignments[r + 1] == -1
-                and flux[r + 1] >= median_f
-                and (mjd[r + 1] - mjd[r]) <= max_gap
+                right < n_points - 1
+                and assignments[right + 1] == -1
+                and flux[right + 1] >= median_f
+                and (mjd[right + 1] - mjd[right]) <= max_gap
             ):
-                if flux[r + 1] < flux[r]:
-                    assignments[r + 1] = p
-                    frontiers[p]['right'] = r + 1
+                if flux[right + 1] < flux[right]:
+                    assignments[right + 1] = p
+                    frontiers[p]['right'] = right + 1
                     expanded = True
-                elif grad[r] <= 0:
-                    assignments[r + 1] = p
-                    frontiers[p]['right'] = r + 1
+                elif grad[right] <= 0:
+                    assignments[right + 1] = p
+                    frontiers[p]['right'] = right + 1
                     expanded = True
 
             if not expanded:
@@ -190,9 +190,11 @@ def detect_flares(
     # Build raw clusters
     raw_clusters = []
     for p in peaks:
-        l, r = frontiers[p]['left'], frontiers[p]['right']
-        if (r - l + 1) >= min_cluster_size:
-            raw_clusters.append({'start_idx': l, 'end_idx': r, 'peak_flux': flux[p]})
+        left, right = frontiers[p]['left'], frontiers[p]['right']
+        if (right - left + 1) >= min_cluster_size:
+            raw_clusters.append(
+                {'start_idx': left, 'end_idx': right, 'peak_flux': flux[p]}
+            )
 
     if not raw_clusters:
         return []
