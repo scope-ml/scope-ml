@@ -1013,36 +1013,16 @@ class RubinLocalDP2Client:
     Client for Rubin EDP2/DP2 DIA forced photometry from a local parquet export.
 
     Unlike DP1, which is distributed here as one parquet file per table,
-    the EDP2 export is a single pre-joined table produced by a TAP query of
-    the form::
-
-        SELECT f.*, d.ra, d.dec
-        FROM dp2.ForcedSourceOnDiaObject AS f,
-             dp2.DiaObject AS d, dp2.DiaSource AS s
-        WHERE f.diaObjectId = d.diaObjectId AND d.diaObjectId = s.diaObjectId
-          AND ... (variability / quality cuts on s)
-
-    Two consequences are handled here:
-
-    1. The three-way join has no ``DISTINCT``, so every forced-source row is
-       repeated once per DiaSource row that passed the cuts (~9x for the
-       reference export). Rows are de-duplicated on
-       ``(diaObjectId, visit, detector)``.
-    2. ``ForcedSourceOnDiaObject`` carries no timestamp, only ``visit``. A
-       separate ``dp2.Visit`` export is required to map visit -> MJD; fetch
-       one with ``tools/fetch_rubin_visits.py``.
+    the EDP2 export is a single table with ``ForcedSourceOnDiaObject`` already
+    joined against ``DiaObject`` (for ``ra``/``dec``) and ``Visit`` (for
+    ``expMidptMJD``), pre-filtered to variability candidates. Everything the
+    pipeline needs is in that one file.
 
     Parameters
     ----------
     data_path : str
-        Path to the pre-joined parquet file, or to a directory containing
-        it (the first ``*.parquet`` / ``*.parquet.gzip`` file that is not a
-        visit table is used).
-    visit_path : str, optional
-        Path to the visit table (parquet with ``visit`` and ``expMidptMJD``
-        columns). If None, looks for ``Visit.parquet``/``Visit.parquet.gzip``
-        next to ``data_path``, then in the ``RUBIN_VISIT_PATH`` environment
-        variable.
+        Path to the export, or to a directory containing exactly one parquet
+        file.
     band_map : dict, optional
         Mapping from band name to integer filter ID.
     flux_column : str, optional
@@ -1051,7 +1031,18 @@ class RubinLocalDP2Client:
         (difference-image flux). Difference fluxes are frequently negative
         and those epochs are dropped, so ``'psfFlux'`` is normally what you
         want for period searching.
+    dedupe : bool, optional
+        Drop repeated ``(diaObjectId, visit, detector)`` rows (default True).
+        A no-op on a well-formed export, but a cheap guard: an export built by
+        joining against ``DiaSource`` without ``DISTINCT`` repeats every epoch
+        once per matching source, which silently inflates epoch counts and
+        corrupts period searches.
     """
+
+    TIME_COLUMN = "expMidptMJD"
+
+    #: Per-object coordinates, joined in from DiaObject.
+    COORD_COLUMNS = ["ra", "dec"]
 
     #: Pixel flags summed into ``catflags``; matches the DP1 clients.
     PIXEL_FLAG_COLUMNS = [
@@ -1073,13 +1064,10 @@ class RubinLocalDP2Client:
     def __init__(
         self,
         data_path,
-        visit_path=None,
         band_map=None,
         flux_column="psfFlux",
         dedupe=True,
     ):
-        import pandas as pd
-
         if flux_column not in self.FLUX_ERR_COLUMNS:
             raise ValueError(
                 f"flux_column must be one of {sorted(self.FLUX_ERR_COLUMNS)}, "
@@ -1092,11 +1080,7 @@ class RubinLocalDP2Client:
         self.flux_err_column, self.flux_flag_column = self.FLUX_ERR_COLUMNS[flux_column]
         self.dedupe = dedupe
 
-        self.visit_path = self._resolve_visit_file(self.data_path, visit_path)
-        self._visit_df = pd.read_parquet(
-            self.visit_path, columns=["visit", "expMidptMJD"]
-        )
-        self._visit_df = self._visit_df.drop_duplicates("visit")
+        self._check_columns()
 
         # Lazy-loaded caches
         self._obj_ids = None
@@ -1119,7 +1103,6 @@ class RubinLocalDP2Client:
                 p
                 for pattern in ("*.parquet", "*.parquet.gzip")
                 for p in glob.glob(os.path.join(data_path, pattern))
-                if not os.path.basename(p).lower().startswith("visit")
             )
             if len(candidates) == 1:
                 return candidates[0]
@@ -1127,37 +1110,39 @@ class RubinLocalDP2Client:
                 raise ValueError(
                     f"{data_path} contains multiple parquet files "
                     f"({[os.path.basename(c) for c in candidates]}); "
-                    f"pass the DP2 forced-source file explicitly."
+                    f"pass the DP2 export explicitly."
                 )
 
-        raise FileNotFoundError(
-            f"No DP2 forced-source parquet file found at {data_path}."
-        )
+        raise FileNotFoundError(f"No DP2 parquet export found at {data_path}.")
 
-    @staticmethod
-    def _resolve_visit_file(data_file, visit_path):
-        """Locate the visit table needed to convert visit IDs to MJD."""
-        if visit_path is not None:
-            if not os.path.isfile(visit_path):
-                raise FileNotFoundError(f"Visit table not found: {visit_path}")
-            return visit_path
+    def _check_columns(self):
+        """Fail fast, with the missing names, rather than deep in a read."""
+        import pyarrow.parquet as pq
 
-        data_dir = os.path.dirname(os.path.abspath(data_file))
-        for fname in ("Visit.parquet", "Visit.parquet.gzip"):
-            candidate = os.path.join(data_dir, fname)
-            if os.path.isfile(candidate):
-                return candidate
+        present = set(pq.ParquetFile(self.data_path).schema_arrow.names)
+        required = self._required_columns() + self.COORD_COLUMNS
+        missing = [c for c in required if c not in present]
+        if missing:
+            raise ValueError(
+                f"{self.data_path} is missing DP2 column(s) {missing}. The "
+                f"export must have ForcedSourceOnDiaObject joined against "
+                f"DiaObject (ra, dec) and Visit ({self.TIME_COLUMN})."
+            )
 
-        env_path = os.environ.get("RUBIN_VISIT_PATH")
-        if env_path and os.path.isfile(env_path):
-            return env_path
-
-        raise FileNotFoundError(
-            "The DP2 forced-source table has no timestamp column, so a visit "
-            "table is required to map visit -> expMidptMJD. Looked for "
-            f"Visit.parquet next to {data_file} and in $RUBIN_VISIT_PATH. "
-            "Create one with: python tools/fetch_rubin_visits.py "
-            "--release dp2 --output <dir>/Visit.parquet"
+    def _required_columns(self):
+        return (
+            [
+                "diaObjectId",
+                "visit",
+                "detector",
+                "band",
+                self.TIME_COLUMN,
+                self.flux_column,
+                self.flux_err_column,
+                self.flux_flag_column,
+            ]
+            + self.PIXEL_FLAG_COLUMNS
+            + self.EXTRA_FLAG_COLUMNS
         )
 
     def _load_objects(self):
@@ -1167,7 +1152,9 @@ class RubinLocalDP2Client:
 
         import pandas as pd
 
-        df = pd.read_parquet(self.data_path, columns=["diaObjectId", "ra", "dec"])
+        df = pd.read_parquet(
+            self.data_path, columns=["diaObjectId"] + self.COORD_COLUMNS
+        )
         df = df.drop_duplicates("diaObjectId")
         df = df.sort_values("diaObjectId")
 
@@ -1179,37 +1166,19 @@ class RubinLocalDP2Client:
         self._obj_dec_rad = np.deg2rad(self._obj_dec_deg)
 
     def _load_forced_sources(self):
-        """Lazy-load the forced-source table, de-duplicated and time-stamped."""
+        """Lazy-load the forced-source table."""
         if self._fs_df is not None:
             return
 
         import pandas as pd
 
-        columns = (
-            [
-                "diaObjectId",
-                "visit",
-                "detector",
-                "band",
-                self.flux_column,
-                self.flux_err_column,
-                self.flux_flag_column,
-            ]
-            + self.PIXEL_FLAG_COLUMNS
-            + self.EXTRA_FLAG_COLUMNS
-        )
-        fs_df = pd.read_parquet(self.data_path, columns=columns)
+        fs_df = pd.read_parquet(self.data_path, columns=self._required_columns())
 
-        # The source query joins ForcedSourceOnDiaObject against DiaSource
-        # without DISTINCT, duplicating each epoch once per matching source.
         if self.dedupe:
             fs_df = fs_df.drop_duplicates(subset=["diaObjectId", "visit", "detector"])
 
         # Rename diaObjectId -> objectId for compatibility with the DP1 clients
         fs_df = fs_df.rename(columns={"diaObjectId": "objectId"})
-
-        # Join with the visit table to get expMidptMJD
-        fs_df = fs_df.merge(self._visit_df, on="visit", how="inner")
 
         flag_cols = (
             self.PIXEL_FLAG_COLUMNS + self.EXTRA_FLAG_COLUMNS + [self.flux_flag_column]
@@ -1225,7 +1194,7 @@ class RubinLocalDP2Client:
                 "band",
                 self.flux_column,
                 self.flux_err_column,
-                "expMidptMJD",
+                self.TIME_COLUMN,
                 "pixelFlags",
             ]
         ]
@@ -1349,23 +1318,39 @@ class RubinLocalDP2Client:
         return _format_frame_as_kowalski(
             subset,
             band_map=self.band_map,
+            time_col=self.TIME_COLUMN,
             flux_col=self.flux_column,
             flux_err_col=self.flux_err_column,
         )
 
-    def get_visit_positions(self):
+    def get_visit_positions(self, columns=None):
         """
-        Return the visit table used to time-stamp the forced sources.
+        Return one row per visit, for cadence and observing-condition checks.
+
+        Parameters
+        ----------
+        columns : list of str, optional
+            Extra per-visit columns to carry through (e.g. ``['expTime',
+            'airmass']``). Columns absent from the export are skipped.
 
         Returns
         -------
         pandas.DataFrame
-            The visit table with ``visit`` and ``expMidptMJD`` columns, plus
-            whatever else the export carried (e.g. ``ra``, ``dec``, ``band``).
+            Unique visits with ``visit``, ``expMidptMJD`` and ``band``.
         """
         import pandas as pd
+        import pyarrow.parquet as pq
 
-        return pd.read_parquet(self.visit_path)
+        wanted = ["visit", self.TIME_COLUMN, "band"] + list(columns or [])
+        present = set(pq.ParquetFile(self.data_path).schema_arrow.names)
+        wanted = [c for c in dict.fromkeys(wanted) if c in present]
+
+        df = pd.read_parquet(self.data_path, columns=wanted)
+        return (
+            df.drop_duplicates("visit")
+            .sort_values(self.TIME_COLUMN)
+            .reset_index(drop=True)
+        )
 
     def get_lightcurves_for_cone(self, ra, dec, radius_arcsec, bands=None, limit=10000):
         """
@@ -1454,8 +1439,6 @@ def make_rubin_client(config=None, use_dia=False, release=None):
         if release == "dp2":
             return RubinLocalDP2Client(
                 data_path=data_path,
-                visit_path=config.get("visit_path")
-                or os.environ.get("RUBIN_VISIT_PATH"),
                 band_map=band_map,
                 flux_column=config.get("flux_column", "psfFlux"),
             )

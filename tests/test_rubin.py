@@ -566,12 +566,41 @@ DP2_PIXEL_FLAGS = {
 }
 
 
-def _create_synthetic_dp2_parquet(tmp_path, write_visits=True):
-    """Create a synthetic DP2-style pre-joined parquet export.
+VISIT_MJD = {100: 60000.0, 200: 60001.5, 300: 60002.25, 400: 60003.0}
 
-    Mimics the real export: no timestamp column, ``diaObjectId``/``ra``/``dec``
-    carried on every row, and each forced-source row duplicated by the
-    DiaSource join.
+
+def _dp2_row(oid, visit, band, flux, diff_flux, ra, dec, flux_err=50.0):
+    """One row of the DP2 export, with Visit and DiaObject already joined in."""
+    return {
+        "diaObjectId": oid,
+        "parentObjectId": 0,
+        "visit": visit,
+        "detector": 12,
+        "band": band,
+        "expMidptMJD": VISIT_MJD[visit],
+        "expTime": 30.0,
+        "psfFlux": flux,
+        "psfFluxErr": flux_err,
+        "psfFlux_flag": False,
+        "psfDiffFlux": diff_flux,
+        "psfDiffFluxErr": 55.0,
+        "psfDiffFlux_flag": False,
+        "ra": ra,
+        "dec": dec,
+        **DP2_PIXEL_FLAGS,
+    }
+
+
+def _create_synthetic_dp2_parquet(tmp_path, duplicate=1, drop_columns=None):
+    """Create a synthetic DP2 export.
+
+    Mimics the real file: ``ForcedSourceOnDiaObject`` with ``ra``/``dec`` from
+    DiaObject and ``expMidptMJD`` from Visit already joined on, one row per
+    (object, visit, detector).
+
+    ``duplicate`` repeats every epoch N times, reproducing an export built by
+    joining against DiaSource without DISTINCT. ``drop_columns`` omits columns,
+    to exercise the schema check.
     """
     import pandas as pd
 
@@ -583,81 +612,30 @@ def _create_synthetic_dp2_parquet(tmp_path, write_visits=True):
 
     rows = []
     for oid, (ra, dec) in coords.items():
-        for visit_id, band, flux in [
-            (100, "g", 1000.0),
-            (200, "g", 1100.0),
-            (300, "r", 900.0),
+        # psfDiffFlux is independent of psfFlux and is non-positive for some
+        # epochs, as in the real difference-image photometry
+        for visit_id, band, flux, diff_flux in [
+            (100, "g", 1000.0, 0.0),
+            (200, "g", 1100.0, 100.0),
+            (300, "r", 900.0, -100.0),
         ]:
-            row = {
-                "diaObjectId": oid,
-                "parentObjectId": 0,
-                "visit": visit_id,
-                "detector": 12,
-                "band": band,
-                "psfFlux": flux + oid * 0.1,
-                "psfFluxErr": 50.0,
-                "psfFlux_flag": False,
-                "psfDiffFlux": flux - 1000.0,
-                "psfDiffFluxErr": 55.0,
-                "psfDiffFlux_flag": False,
-                "ra": ra,
-                "dec": dec,
-                **DP2_PIXEL_FLAGS,
-            }
-            # The three-way join emits each epoch three times
-            rows.extend([dict(row) for _ in range(3)])
+            row = _dp2_row(oid, visit_id, band, flux + oid * 0.1, diff_flux, ra, dec)
+            rows.extend([dict(row) for _ in range(duplicate)])
 
     # Negative flux epoch, to be dropped by the mag conversion
-    rows.append(
-        {
-            "diaObjectId": 2001,
-            "parentObjectId": 0,
-            "visit": 400,
-            "detector": 12,
-            "band": "i",
-            "psfFlux": -100.0,
-            "psfFluxErr": 10.0,
-            "psfFlux_flag": False,
-            "psfDiffFlux": -100.0,
-            "psfDiffFluxErr": 10.0,
-            "psfDiffFlux_flag": False,
-            "ra": coords[2001][0],
-            "dec": coords[2001][1],
-            **DP2_PIXEL_FLAGS,
-        }
-    )
+    rows.append(_dp2_row(2001, 400, "i", -100.0, -100.0, *coords[2001], flux_err=10.0))
 
     # Flagged epoch, kept but with nonzero catflags
-    flagged = {
-        "diaObjectId": 2002,
-        "parentObjectId": 0,
-        "visit": 400,
-        "detector": 12,
-        "band": "i",
-        "psfFlux": 800.0,
-        "psfFluxErr": 40.0,
-        "psfFlux_flag": False,
-        "psfDiffFlux": 10.0,
-        "psfDiffFluxErr": 40.0,
-        "psfDiffFlux_flag": False,
-        "ra": coords[2002][0],
-        "dec": coords[2002][1],
-        **DP2_PIXEL_FLAGS,
-    }
+    flagged = _dp2_row(2002, 400, "i", 800.0, 10.0, *coords[2002], flux_err=40.0)
     flagged["pixelFlags_cr"] = True
     rows.append(flagged)
 
+    df = pd.DataFrame(rows)
+    if drop_columns:
+        df = df.drop(columns=list(drop_columns))
+
     data_file = tmp_path / "VarCands_DP2.parquet"
-    pd.DataFrame(rows).to_parquet(data_file, index=False)
-
-    if write_visits:
-        pd.DataFrame(
-            {
-                "visit": [100, 200, 300, 400],
-                "expMidptMJD": [60000.0, 60001.5, 60002.25, 60003.0],
-            }
-        ).to_parquet(tmp_path / "Visit.parquet", index=False)
-
+    df.to_parquet(data_file, index=False)
     return str(data_file)
 
 
@@ -675,40 +653,43 @@ class TestRubinLocalDP2Client:
         client = RubinLocalDP2Client(str(self.tmp_path))
         assert client.data_path == self.data_file
 
-    def test_missing_visit_table_raises(self, tmp_path_factory, monkeypatch):
-        """Without a visit table there is no way to time-stamp epochs."""
-        monkeypatch.delenv("RUBIN_VISIT_PATH", raising=False)
-        other = tmp_path_factory.mktemp("dp2_no_visits")
-        data_file = _create_synthetic_dp2_parquet(other, write_visits=False)
-        with pytest.raises(FileNotFoundError, match="visit table is required"):
+    def test_missing_time_column_raises(self, tmp_path_factory):
+        """An export without the Visit join cannot be time-stamped."""
+        other = tmp_path_factory.mktemp("dp2_no_mjd")
+        data_file = _create_synthetic_dp2_parquet(other, drop_columns=["expMidptMJD"])
+        with pytest.raises(ValueError, match="expMidptMJD"):
             RubinLocalDP2Client(data_file)
 
-    def test_visit_path_from_env(self, tmp_path_factory, monkeypatch):
-        """RUBIN_VISIT_PATH should be used when no sibling visit table exists."""
-        other = tmp_path_factory.mktemp("dp2_env_visits")
-        data_file = _create_synthetic_dp2_parquet(other, write_visits=False)
-        visit_path = str(self.tmp_path / "Visit.parquet")
-        monkeypatch.setenv("RUBIN_VISIT_PATH", visit_path)
-        client = RubinLocalDP2Client(data_file)
-        assert client.visit_path == visit_path
+    def test_missing_coords_raise(self, tmp_path_factory):
+        """An export without the DiaObject join has no coordinates."""
+        other = tmp_path_factory.mktemp("dp2_no_coords")
+        data_file = _create_synthetic_dp2_parquet(other, drop_columns=["dec"])
+        with pytest.raises(ValueError, match="dec"):
+            RubinLocalDP2Client(data_file)
 
     def test_bad_flux_column_raises(self):
         with pytest.raises(ValueError, match="flux_column"):
             RubinLocalDP2Client(self.data_file, flux_column="apFlux")
 
-    def test_join_duplicates_are_removed(self):
-        """Each (object, visit, detector) should appear exactly once."""
+    def test_clean_export_is_unchanged_by_dedupe(self):
+        """One row per (object, visit, detector) already: nothing to drop."""
         self.client._load_forced_sources()
         fs = self.client._fs_df
         # 3 objects x 3 epochs + 1 negative-flux + 1 flagged row
         assert len(fs) == 11
         assert not fs.duplicated(subset=["objectId", "band", "expMidptMJD"]).any()
 
-    def test_dedupe_can_be_disabled(self):
-        """dedupe=False leaves the raw join duplicates in place."""
-        client = RubinLocalDP2Client(self.data_file, dedupe=False)
+    def test_dedupe_guards_against_a_bad_join(self, tmp_path_factory):
+        """An export with DiaSource-join duplicates collapses back to 11 rows."""
+        other = tmp_path_factory.mktemp("dp2_dupes")
+        data_file = _create_synthetic_dp2_parquet(other, duplicate=3)
+        client = RubinLocalDP2Client(data_file)
         client._load_forced_sources()
-        assert len(client._fs_df) == 29  # 27 duplicated + 2 singles
+        assert len(client._fs_df) == 11
+
+        unguarded = RubinLocalDP2Client(data_file, dedupe=False)
+        unguarded._load_forced_sources()
+        assert len(unguarded._fs_df) == 29  # 27 duplicated + 2 singles
 
     def test_all_objects(self):
         objects = self.client.get_all_objects()
@@ -738,11 +719,11 @@ class TestRubinLocalDP2Client:
         point = g_lc["data"][0]
         assert set(point) == {"hjd", "mag", "magerr", "catflags"}
 
-    def test_visit_join_supplies_mjd(self):
-        """Epoch times should come from the visit table, not the visit ID."""
+    def test_epoch_times_come_from_expmidptmjd(self):
+        """Epoch times should be the export's MJDs, not derived from visit IDs."""
         lcs = self.client.get_lightcurves([2001], bands=["g"])
         times = sorted(p["hjd"] for p in lcs[0]["data"])
-        assert times == [60000.0, 60001.5]
+        assert times == [VISIT_MJD[100], VISIT_MJD[200]]
 
     def test_points_are_time_sorted(self):
         lcs = self.client.get_lightcurves([2001], bands=["g"])
@@ -796,6 +777,13 @@ class TestRubinLocalDP2Client:
         visits = self.client.get_visit_positions()
         assert "expMidptMJD" in visits.columns
         assert len(visits) == 4
+        assert list(visits["expMidptMJD"]) == sorted(VISIT_MJD.values())
+
+    def test_get_visit_positions_extra_columns(self):
+        visits = self.client.get_visit_positions(columns=["expTime", "airmass"])
+        # expTime is in the export, airmass is not: skipped, not an error
+        assert "expTime" in visits.columns
+        assert "airmass" not in visits.columns
 
 
 class TestFormatFrameAsKowalski:
@@ -1398,11 +1386,10 @@ class TestIntegrationRubinLocal:
 # --- Integration tests for the local EDP2/DP2 export ---
 
 DP2_LOCAL_PATH = "/fred/oz480/jfreebur/EDP2/VarCands_DP2.parquet"
-DP2_VISIT_PATH = "/fred/oz480/mcoughli/EDP2/Visit.parquet"
 
 
 @pytest.mark.skipif(
-    not (os.path.isfile(DP2_LOCAL_PATH) and os.path.isfile(DP2_VISIT_PATH)),
+    not os.path.isfile(DP2_LOCAL_PATH),
     reason=f"Integration test requires the DP2 export at {DP2_LOCAL_PATH}",
 )
 class TestIntegrationRubinLocalDP2:
@@ -1410,9 +1397,7 @@ class TestIntegrationRubinLocalDP2:
 
     @pytest.fixture(autouse=True)
     def setup_client(self):
-        self.client = RubinLocalDP2Client(
-            data_path=DP2_LOCAL_PATH, visit_path=DP2_VISIT_PATH
-        )
+        self.client = RubinLocalDP2Client(data_path=DP2_LOCAL_PATH)
 
     def test_all_objects(self):
         objects = self.client.get_all_objects()
@@ -1441,8 +1426,16 @@ class TestIntegrationRubinLocalDP2:
             assert np.all(np.isfinite(mags))
             assert 10.0 < np.median(mags) < 30.0
 
-    def test_epochs_match_deduplicated_row_count(self):
-        """Retrieved epochs should not carry the SQL join duplication."""
+    def test_export_has_no_duplicate_epochs(self):
+        """The export should already be one row per (object, visit, detector)."""
+        import pandas as pd
+
+        raw = pd.read_parquet(
+            DP2_LOCAL_PATH, columns=["diaObjectId", "visit", "detector"]
+        )
+        assert not raw.duplicated(["diaObjectId", "visit", "detector"]).any()
+
+    def test_epoch_count_matches_positive_flux_rows(self):
         import pandas as pd
 
         objects = self.client.get_all_objects()
@@ -1460,3 +1453,9 @@ class TestIntegrationRubinLocalDP2:
 
         lcs = self.client.get_lightcurves([objectid])
         assert sum(len(lc["data"]) for lc in lcs) == expected
+
+    def test_visit_positions_span_the_survey(self):
+        visits = self.client.get_visit_positions(columns=["expTime", "airmass"])
+        assert len(visits) > 1000
+        assert visits["expMidptMJD"].is_monotonic_increasing
+        assert not visits["visit"].duplicated().any()

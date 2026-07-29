@@ -118,4 +118,3 @@ Completed chunks are saved to `/fred/oz480/mcoughli/generated_features_rubin/chu
 | `prepare-rubin-chunks` | Scan local parquet files and split eligible objects into chunk CSVs |
 | `generate-features-rubin-slurm` | Generate a SLURM array job script from chunk files |
 | `combine-rubin-features` | Merge per-chunk parquet outputs into a single file |
-| `fetch-rubin-visits` | Download a Rubin Visit table via TAP (needed for [DP2](rubin-dp2.md)) |

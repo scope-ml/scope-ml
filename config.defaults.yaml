@@ -35,11 +35,6 @@ rubin:
   # DP2: the pre-joined ForcedSourceOnDiaObject export (falls back to
   # data_path if unset), so one config can describe both releases
   dp2_data_path:
-  # DP2 only: visit table mapping visit -> expMidptMJD, since the DP2
-  # forced-source export carries no timestamp. Leave blank to look for
-  # Visit.parquet next to data_path. Create one with:
-  #   python tools/fetch_rubin_visits.py --release dp2 --output <dir>/Visit.parquet
-  visit_path:
   # DP2 only: psfFlux (direct image, default) or psfDiffFlux (difference image)
   flux_column: psfFlux
   timeout: 300
