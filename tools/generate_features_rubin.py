@@ -26,19 +26,17 @@ import warnings
 import json
 import time
 
-# Flush stdout/stderr after every print so SLURM logs update in real time
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
 from scope.utils import (
-    removeHighCadence,
     write_parquet,
-    sort_lightcurve,
     parse_load_config,
 )
 from scope.surveys.rubin import make_rubin_client
 from tools.get_rubin_ids import get_rubin_objects_by_cone, get_rubin_objects_from_file
 from tools.featureGeneration import periodsearch
+
+# Flush stdout/stderr after every print so SLURM logs update in real time
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 BASE_DIR = pathlib.Path.cwd()
 config = parse_load_config()
@@ -422,7 +420,7 @@ def generate_features_rubin(
         mag, err = tme[1], tme[2]
         for band_int, band_name in BAND_NAMES.items():
             if bb is not None:
-                mask = (bb == band_int)
+                mask = bb == band_int
                 n_band = int(mask.sum())
             else:
                 n_band = 0
@@ -816,7 +814,7 @@ def generate_features_rubin(
             tme = tme_dict[_id]['tme']
             bb = tme_dict[_id].get('band')
             t_arr, m_arr, e_arr = tme[0], tme[1], tme[2]
-            w_all = e_arr ** -2
+            w_all = e_arr**-2
 
             # Per-band median subtraction to remove chromatic offsets
             m_corr = m_arr.copy()
@@ -877,17 +875,13 @@ def generate_features_rubin(
 
                 # R² = variance reduction from phase folding
                 within_var = (
-                    within_var_sum / within_w_sum if within_w_sum > 0
-                    else total_var
+                    within_var_sum / within_w_sum if within_w_sum > 0 else total_var
                 )
                 r2 = float(max(1.0 - within_var / total_var, 0.0))
 
                 # Amplitude SNR = binned peak-to-peak / mean within-bin RMS
                 amp = float(bm.max() - bm.min())
-                mean_rms = (
-                    float(np.mean(within_rms_list)) if within_rms_list
-                    else 1.0
-                )
+                mean_rms = float(np.mean(within_rms_list)) if within_rms_list else 1.0
                 amp_snr = amp / mean_rms if mean_rms > 1e-10 else 0.0
 
                 # Sawtooth correlation
@@ -899,13 +893,9 @@ def generate_features_rubin(
                         if ts > 1e-10:
                             best_saw = max(
                                 best_saw,
-                                np.corrcoef(
-                                    (tmpl - tmpl.mean()) / ts, bm_n
-                                )[0, 1],
+                                np.corrcoef((tmpl - tmpl.mean()) / ts, bm_n)[0, 1],
                             )
-                feature_dict[_id][f'mf_sawtooth_{aname}'] = float(
-                    max(best_saw, 0.0)
-                )
+                feature_dict[_id][f'mf_sawtooth_{aname}'] = float(max(best_saw, 0.0))
 
                 # Sinusoidal correlation
                 best_sin = -1.0
@@ -915,13 +905,9 @@ def generate_features_rubin(
                     if ts > 1e-10:
                         best_sin = max(
                             best_sin,
-                            np.corrcoef(
-                                (tmpl - tmpl.mean()) / ts, bm_n
-                            )[0, 1],
+                            np.corrcoef((tmpl - tmpl.mean()) / ts, bm_n)[0, 1],
                         )
-                feature_dict[_id][f'mf_sinusoidal_{aname}'] = float(
-                    max(best_sin, 0.0)
-                )
+                feature_dict[_id][f'mf_sinusoidal_{aname}'] = float(max(best_sin, 0.0))
 
                 # Eclipsing correlation
                 best_ecl = -1.0
@@ -933,13 +919,9 @@ def generate_features_rubin(
                             if ts > 1e-10:
                                 best_ecl = max(
                                     best_ecl,
-                                    np.corrcoef(
-                                        (tmpl - tmpl.mean()) / ts, bm_n
-                                    )[0, 1],
+                                    np.corrcoef((tmpl - tmpl.mean()) / ts, bm_n)[0, 1],
                                 )
-                feature_dict[_id][f'mf_eclipsing_{aname}'] = float(
-                    max(best_ecl, 0.0)
-                )
+                feature_dict[_id][f'mf_eclipsing_{aname}'] = float(max(best_ecl, 0.0))
 
                 # Store R², amplitude SNR, phase coverage, combined score
                 feature_dict[_id][f'mf_R2_{aname}'] = r2
@@ -951,8 +933,10 @@ def generate_features_rubin(
                     best_corr * r2 * coverage
                 )
 
-        print(f'  Matched filter scores computed for {len(keep_id_list)} sources '
-              f'x {len(algo_names_mf)} algorithms')
+        print(
+            f'  Matched filter scores computed for {len(keep_id_list)} sources '
+            f'x {len(algo_names_mf)} algorithms'
+        )
 
     # --- 6. Fourier Statistics ---
     print(f'Computing Fourier stats for {len(period_dict)} algorithms...')
@@ -1003,7 +987,9 @@ def generate_features_rubin(
     # (K≥2 dominant) shapes without re-running the full periodogram.
     if doCPU or doGPU:
         MHF_MAX_K = 5
-        mhf_per_k_names = [f'mhf_dbic_k{k}' for k in range(MHF_MAX_K + 1)] + ['mhf_best_k']
+        mhf_per_k_names = [f'mhf_dbic_k{k}' for k in range(MHF_MAX_K + 1)] + [
+            'mhf_best_k'
+        ]
 
         print(f'Computing MHF per-K BIC features (max_harmonics={MHF_MAX_K})...')
         id_list_mhf = list(tme_dict.keys())
@@ -1022,7 +1008,9 @@ def generate_features_rubin(
             )
 
             per_k_features = periodsearch.compute_mhf_per_k_features(
-                lightcurves_mhf, periods_for_algo, max_harmonics=MHF_MAX_K,
+                lightcurves_mhf,
+                periods_for_algo,
+                max_harmonics=MHF_MAX_K,
                 bands=[tme_dict[_id].get('band') for _id in id_list_mhf],
             )
 
