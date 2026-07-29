@@ -46,6 +46,7 @@ nav:
     - Training Models: user-guide/training.md
     - Running Inference: user-guide/inference.md
     - Rubin DP1: user-guide/rubin-dp1.md
+    - Rubin EDP2/DP2: user-guide/rubin-dp2.md
     - HPC Scripts: user-guide/hpc-scripts.md
   - Field Guide:
     - Overview: field-guide/index.md

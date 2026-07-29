@@ -2,11 +2,13 @@
 """
 Rubin LSST TAP client for scope-ml.
 
-Provides access to Rubin Data Preview (DP1) data via the TAP API,
-converting forced photometry lightcurves into the same format consumed
-by the scope-ml feature generation pipeline.
+Provides access to Rubin Data Preview (DP1) and Early Data Preview 2
+(EDP2/DP2) data via the TAP API or local parquet exports, converting
+forced photometry lightcurves into the same format consumed by the
+scope-ml feature generation pipeline.
 """
 
+import glob
 import os
 import numpy as np
 import warnings
@@ -110,6 +112,94 @@ def _format_as_kowalski(rows, band_map=None):
             )
         if len(data) > 0:
             result.append({"_id": obj_id, "filter": filt, "data": data})
+
+    return result
+
+
+def _format_frame_as_kowalski(
+    df,
+    band_map=None,
+    id_col="objectId",
+    band_col="band",
+    time_col="expMidptMJD",
+    flux_col="psfFlux",
+    flux_err_col="psfFluxErr",
+    flag_col="pixelFlags",
+):
+    """
+    Vectorized equivalent of :func:`_format_as_kowalski` for DataFrames.
+
+    Produces the same output structure, but converts fluxes with numpy
+    array operations instead of a Python loop over rows. Points within
+    each (objectId, band) group are sorted by time.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Must contain the columns named by ``id_col``, ``band_col``,
+        ``time_col``, ``flux_col``, ``flux_err_col`` and ``flag_col``.
+    band_map : dict, optional
+        Mapping from band name (str) to integer filter ID.
+
+    Returns
+    -------
+    list of dict
+        Kowalski-format lightcurve dicts.
+    """
+    if band_map is None:
+        band_map = DEFAULT_BAND_MAP
+
+    if len(df) == 0:
+        return []
+
+    flux = df[flux_col].values.astype(np.float64)
+    flux_err = df[flux_err_col].values.astype(np.float64)
+    good = (flux > 0) & (flux_err > 0)
+    if not good.any():
+        return []
+
+    obj_ids = df[id_col].values[good]
+    bands = df[band_col].values[good]
+    times = df[time_col].values[good].astype(np.float64)
+    flags = df[flag_col].values[good].astype(np.int64)
+    mag, magerr = _flux_to_mag(flux[good], flux_err[good])
+
+    # Sort by (objectId, band, time) so each group is contiguous and
+    # time-ordered; np.lexsort keys are applied last-to-first.
+    order = np.lexsort((times, bands, obj_ids))
+    obj_ids = obj_ids[order]
+    bands = bands[order]
+    times = times[order]
+    flags = flags[order]
+    mag = mag[order]
+    magerr = magerr[order]
+
+    # Group boundaries wherever (objectId, band) changes
+    if len(obj_ids) == 1:
+        starts = np.array([0])
+    else:
+        changed = (obj_ids[1:] != obj_ids[:-1]) | (bands[1:] != bands[:-1])
+        starts = np.concatenate(([0], np.flatnonzero(changed) + 1))
+    ends = np.concatenate((starts[1:], [len(obj_ids)]))
+
+    result = []
+    for start, end in zip(starts, ends):
+        data = [
+            {
+                "hjd": float(times[k]),
+                "mag": float(mag[k]),
+                "magerr": float(magerr[k]),
+                "catflags": int(flags[k]),
+            }
+            for k in range(start, end)
+        ]
+        result.append(
+            {
+                "_id": int(obj_ids[start]),
+                "filter": band_map.get(str(bands[start]), -1),
+                "data": data,
+            }
+        )
 
     return result
 
@@ -918,13 +1008,406 @@ class RubinLocalDiaClient:
         return objects, lightcurves
 
 
-def make_rubin_client(config=None, use_dia=False):
+class RubinLocalDP2Client:
+    """
+    Client for Rubin EDP2/DP2 DIA forced photometry from a local parquet export.
+
+    Unlike DP1, which is distributed here as one parquet file per table,
+    the EDP2 export is a single pre-joined table produced by a TAP query of
+    the form::
+
+        SELECT f.*, d.ra, d.dec
+        FROM dp2.ForcedSourceOnDiaObject AS f,
+             dp2.DiaObject AS d, dp2.DiaSource AS s
+        WHERE f.diaObjectId = d.diaObjectId AND d.diaObjectId = s.diaObjectId
+          AND ... (variability / quality cuts on s)
+
+    Two consequences are handled here:
+
+    1. The three-way join has no ``DISTINCT``, so every forced-source row is
+       repeated once per DiaSource row that passed the cuts (~9x for the
+       reference export). Rows are de-duplicated on
+       ``(diaObjectId, visit, detector)``.
+    2. ``ForcedSourceOnDiaObject`` carries no timestamp, only ``visit``. A
+       separate ``dp2.Visit`` export is required to map visit -> MJD; fetch
+       one with ``tools/fetch_rubin_visits.py``.
+
+    Parameters
+    ----------
+    data_path : str
+        Path to the pre-joined parquet file, or to a directory containing
+        it (the first ``*.parquet`` / ``*.parquet.gzip`` file that is not a
+        visit table is used).
+    visit_path : str, optional
+        Path to the visit table (parquet with ``visit`` and ``expMidptMJD``
+        columns). If None, looks for ``Visit.parquet``/``Visit.parquet.gzip``
+        next to ``data_path``, then in the ``RUBIN_VISIT_PATH`` environment
+        variable.
+    band_map : dict, optional
+        Mapping from band name to integer filter ID.
+    flux_column : str, optional
+        Which forced photometry to convert to magnitudes: ``'psfFlux'``
+        (direct-image forced PSF flux, the default) or ``'psfDiffFlux'``
+        (difference-image flux). Difference fluxes are frequently negative
+        and those epochs are dropped, so ``'psfFlux'`` is normally what you
+        want for period searching.
+    """
+
+    #: Pixel flags summed into ``catflags``; matches the DP1 clients.
+    PIXEL_FLAG_COLUMNS = [
+        "pixelFlags_bad",
+        "pixelFlags_cr",
+        "pixelFlags_edge",
+        "pixelFlags_saturated",
+        "pixelFlags_suspect",
+    ]
+
+    #: Per-measurement flags also folded into ``catflags`` (DP2 only).
+    EXTRA_FLAG_COLUMNS = ["invalidPsfFlag"]
+
+    FLUX_ERR_COLUMNS = {
+        "psfFlux": ("psfFluxErr", "psfFlux_flag"),
+        "psfDiffFlux": ("psfDiffFluxErr", "psfDiffFlux_flag"),
+    }
+
+    def __init__(
+        self,
+        data_path,
+        visit_path=None,
+        band_map=None,
+        flux_column="psfFlux",
+        dedupe=True,
+    ):
+        import pandas as pd
+
+        if flux_column not in self.FLUX_ERR_COLUMNS:
+            raise ValueError(
+                f"flux_column must be one of {sorted(self.FLUX_ERR_COLUMNS)}, "
+                f"got {flux_column!r}"
+            )
+
+        self.data_path = self._resolve_data_file(data_path)
+        self.band_map = band_map or DEFAULT_BAND_MAP
+        self.flux_column = flux_column
+        self.flux_err_column, self.flux_flag_column = self.FLUX_ERR_COLUMNS[flux_column]
+        self.dedupe = dedupe
+
+        self.visit_path = self._resolve_visit_file(self.data_path, visit_path)
+        self._visit_df = pd.read_parquet(
+            self.visit_path, columns=["visit", "expMidptMJD"]
+        )
+        self._visit_df = self._visit_df.drop_duplicates("visit")
+
+        # Lazy-loaded caches
+        self._obj_ids = None
+        self._obj_ra_rad = None
+        self._obj_dec_rad = None
+        self._obj_ra_deg = None
+        self._obj_dec_deg = None
+
+        self._fs_df = None
+        self._fs_object_ids = None
+
+    @staticmethod
+    def _resolve_data_file(data_path):
+        """Accept either the parquet file itself or its parent directory."""
+        if os.path.isfile(data_path):
+            return data_path
+
+        if os.path.isdir(data_path):
+            candidates = sorted(
+                p
+                for pattern in ("*.parquet", "*.parquet.gzip")
+                for p in glob.glob(os.path.join(data_path, pattern))
+                if not os.path.basename(p).lower().startswith("visit")
+            )
+            if len(candidates) == 1:
+                return candidates[0]
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"{data_path} contains multiple parquet files "
+                    f"({[os.path.basename(c) for c in candidates]}); "
+                    f"pass the DP2 forced-source file explicitly."
+                )
+
+        raise FileNotFoundError(
+            f"No DP2 forced-source parquet file found at {data_path}."
+        )
+
+    @staticmethod
+    def _resolve_visit_file(data_file, visit_path):
+        """Locate the visit table needed to convert visit IDs to MJD."""
+        if visit_path is not None:
+            if not os.path.isfile(visit_path):
+                raise FileNotFoundError(f"Visit table not found: {visit_path}")
+            return visit_path
+
+        data_dir = os.path.dirname(os.path.abspath(data_file))
+        for fname in ("Visit.parquet", "Visit.parquet.gzip"):
+            candidate = os.path.join(data_dir, fname)
+            if os.path.isfile(candidate):
+                return candidate
+
+        env_path = os.environ.get("RUBIN_VISIT_PATH")
+        if env_path and os.path.isfile(env_path):
+            return env_path
+
+        raise FileNotFoundError(
+            "The DP2 forced-source table has no timestamp column, so a visit "
+            "table is required to map visit -> expMidptMJD. Looked for "
+            f"Visit.parquet next to {data_file} and in $RUBIN_VISIT_PATH. "
+            "Create one with: python tools/fetch_rubin_visits.py "
+            "--release dp2 --output <dir>/Visit.parquet"
+        )
+
+    def _load_objects(self):
+        """Lazy-load per-object coordinates from the pre-joined table."""
+        if self._obj_ids is not None:
+            return
+
+        import pandas as pd
+
+        df = pd.read_parquet(self.data_path, columns=["diaObjectId", "ra", "dec"])
+        df = df.drop_duplicates("diaObjectId")
+        df = df.sort_values("diaObjectId")
+
+        self._obj_ids = df["diaObjectId"].values
+        self._obj_ra_deg = df["ra"].values.astype(np.float64)
+        self._obj_dec_deg = df["dec"].values.astype(np.float64)
+
+        self._obj_ra_rad = np.deg2rad(self._obj_ra_deg)
+        self._obj_dec_rad = np.deg2rad(self._obj_dec_deg)
+
+    def _load_forced_sources(self):
+        """Lazy-load the forced-source table, de-duplicated and time-stamped."""
+        if self._fs_df is not None:
+            return
+
+        import pandas as pd
+
+        columns = (
+            [
+                "diaObjectId",
+                "visit",
+                "detector",
+                "band",
+                self.flux_column,
+                self.flux_err_column,
+                self.flux_flag_column,
+            ]
+            + self.PIXEL_FLAG_COLUMNS
+            + self.EXTRA_FLAG_COLUMNS
+        )
+        fs_df = pd.read_parquet(self.data_path, columns=columns)
+
+        # The source query joins ForcedSourceOnDiaObject against DiaSource
+        # without DISTINCT, duplicating each epoch once per matching source.
+        if self.dedupe:
+            fs_df = fs_df.drop_duplicates(subset=["diaObjectId", "visit", "detector"])
+
+        # Rename diaObjectId -> objectId for compatibility with the DP1 clients
+        fs_df = fs_df.rename(columns={"diaObjectId": "objectId"})
+
+        # Join with the visit table to get expMidptMJD
+        fs_df = fs_df.merge(self._visit_df, on="visit", how="inner")
+
+        flag_cols = (
+            self.PIXEL_FLAG_COLUMNS + self.EXTRA_FLAG_COLUMNS + [self.flux_flag_column]
+        )
+        fs_df["pixelFlags"] = sum(fs_df[c].astype(np.int64) for c in flag_cols)
+
+        # Sort by objectId for searchsorted lookups
+        fs_df = fs_df.sort_values("objectId").reset_index(drop=True)
+
+        self._fs_df = fs_df[
+            [
+                "objectId",
+                "band",
+                self.flux_column,
+                self.flux_err_column,
+                "expMidptMJD",
+                "pixelFlags",
+            ]
+        ]
+        self._fs_object_ids = self._fs_df["objectId"].values
+
+    def get_all_objects(self):
+        """
+        Return every object in the export.
+
+        The DP2 export is already a variability-candidate selection, so
+        iterating all of it is a common entry point.
+
+        Returns
+        -------
+        dict
+            {objectId: {'coord_ra': ra_deg, 'coord_dec': dec_deg}, ...}
+        """
+        self._load_objects()
+        return {
+            int(self._obj_ids[i]): {
+                "coord_ra": float(self._obj_ra_deg[i]),
+                "coord_dec": float(self._obj_dec_deg[i]),
+            }
+            for i in range(len(self._obj_ids))
+        }
+
+    def get_objects_by_cone(self, ra, dec, radius_arcsec, limit=10000):
+        """
+        Find DIA objects within a cone search region.
+
+        Parameters
+        ----------
+        ra : float
+            Right ascension in degrees.
+        dec : float
+            Declination in degrees.
+        radius_arcsec : float
+            Search radius in arcseconds.
+        limit : int, optional
+            Maximum number of objects to return (default 10000).
+
+        Returns
+        -------
+        dict
+            {objectId: {'coord_ra': ra_deg, 'coord_dec': dec_deg}, ...}
+        """
+        from astropy.coordinates import angular_separation
+
+        self._load_objects()
+
+        radius_rad = np.deg2rad(radius_arcsec / 3600.0)
+        sep = angular_separation(
+            np.deg2rad(ra),
+            np.deg2rad(dec),
+            self._obj_ra_rad,
+            self._obj_dec_rad,
+        )
+
+        cone_mask = sep <= radius_rad
+        obj_ids = self._obj_ids[cone_mask]
+        obj_ra = self._obj_ra_deg[cone_mask]
+        obj_dec = self._obj_dec_deg[cone_mask]
+
+        if limit is not None and len(obj_ids) > limit:
+            obj_ids = obj_ids[:limit]
+            obj_ra = obj_ra[:limit]
+            obj_dec = obj_dec[:limit]
+
+        objects = {}
+        for i in range(len(obj_ids)):
+            objects[int(obj_ids[i])] = {
+                "coord_ra": float(obj_ra[i]),
+                "coord_dec": float(obj_dec[i]),
+            }
+
+        return objects
+
+    def get_lightcurves(self, objectids, bands=None, batch_size=1000):
+        """
+        Retrieve forced photometry lightcurves for a list of DIA object IDs.
+
+        Parameters
+        ----------
+        objectids : list of int
+            DIA object IDs to query.
+        bands : list of str, optional
+            Band names to filter (e.g., ['g', 'r']). If None, all bands.
+        batch_size : int, optional
+            Not used for local backend (kept for API compatibility).
+
+        Returns
+        -------
+        list of dict
+            Kowalski-format lightcurve dicts, one per (objectId, band).
+        """
+        if len(objectids) == 0:
+            return []
+
+        self._load_forced_sources()
+
+        oid_list = sorted({int(oid) for oid in objectids})
+        left_indices = np.searchsorted(self._fs_object_ids, oid_list, side="left")
+        right_indices = np.searchsorted(self._fs_object_ids, oid_list, side="right")
+
+        idx_list = [
+            np.arange(left, right)
+            for left, right in zip(left_indices, right_indices)
+            if left < right
+        ]
+        if len(idx_list) == 0:
+            return []
+
+        subset = self._fs_df.iloc[np.concatenate(idx_list)]
+
+        if bands is not None and len(bands) > 0:
+            subset = subset[subset["band"].isin(bands)]
+
+        if len(subset) == 0:
+            return []
+
+        return _format_frame_as_kowalski(
+            subset,
+            band_map=self.band_map,
+            flux_col=self.flux_column,
+            flux_err_col=self.flux_err_column,
+        )
+
+    def get_visit_positions(self):
+        """
+        Return the visit table used to time-stamp the forced sources.
+
+        Returns
+        -------
+        pandas.DataFrame
+            The visit table with ``visit`` and ``expMidptMJD`` columns, plus
+            whatever else the export carried (e.g. ``ra``, ``dec``, ``band``).
+        """
+        import pandas as pd
+
+        return pd.read_parquet(self.visit_path)
+
+    def get_lightcurves_for_cone(self, ra, dec, radius_arcsec, bands=None, limit=10000):
+        """
+        Convenience method: cone search + lightcurve retrieval in one call.
+
+        Parameters
+        ----------
+        ra : float
+            Right ascension in degrees.
+        dec : float
+            Declination in degrees.
+        radius_arcsec : float
+            Search radius in arcseconds.
+        bands : list of str, optional
+            Band names to filter.
+        limit : int, optional
+            Maximum number of objects from cone search.
+
+        Returns
+        -------
+        objects : dict
+            Object metadata from cone search.
+        lightcurves : list of dict
+            Kowalski-format lightcurve dicts.
+        """
+        objects = self.get_objects_by_cone(ra, dec, radius_arcsec, limit=limit)
+        if len(objects) == 0:
+            return objects, []
+
+        objectids = list(objects.keys())
+        lightcurves = self.get_lightcurves(objectids, bands=bands)
+        return objects, lightcurves
+
+
+def make_rubin_client(config=None, use_dia=False, release=None):
     """
     Factory function to create the appropriate Rubin client.
 
-    Returns a RubinLocalClient (or RubinLocalDiaClient if use_dia=True)
-    if a data_path is configured (via config dict or RUBIN_DATA_PATH
-    environment variable), otherwise returns a RubinTAPClient.
+    Returns a RubinLocalClient (or RubinLocalDiaClient if use_dia=True,
+    or RubinLocalDP2Client for the DP2 release) if a data_path is
+    configured (via config dict or RUBIN_DATA_PATH environment variable),
+    otherwise returns a RubinTAPClient.
 
     Parameters
     ----------
@@ -932,21 +1415,57 @@ def make_rubin_client(config=None, use_dia=False):
         Rubin config section (e.g., from config['rubin']).
     use_dia : bool, optional
         If True, use DiaObject + ForcedSourceOnDiaObject tables instead
-        of Object + ForcedSource. Default False.
+        of Object + ForcedSource. Default False. Ignored for DP2, whose
+        local export is DIA forced photometry by construction.
+    release : str, optional
+        Data release to read: ``'dp1'`` (default) or ``'dp2'``. If None,
+        falls back to ``config['release']`` then the ``RUBIN_RELEASE``
+        environment variable. DP2 reads ``config['dp2_data_path']`` (or
+        ``RUBIN_DP2_DATA_PATH``) if set, so one config can hold both
+        releases; otherwise it falls back to ``data_path``.
 
     Returns
     -------
-    RubinTAPClient, RubinLocalClient, or RubinLocalDiaClient
+    RubinTAPClient, RubinLocalClient, RubinLocalDiaClient, or
+    RubinLocalDP2Client
     """
     if config is None:
         config = {}
 
+    if release is None:
+        release = config.get("release") or os.environ.get("RUBIN_RELEASE") or "dp1"
+    release = str(release).lower()
+
+    if release not in ("dp1", "dp2"):
+        raise ValueError(f"Unknown Rubin release {release!r}; expected 'dp1' or 'dp2'.")
+
     data_path = config.get("data_path") or os.environ.get("RUBIN_DATA_PATH")
+    if release == "dp2":
+        # dp2_data_path lets a single config hold both releases, since the
+        # DP1 and DP2 exports have entirely different layouts.
+        data_path = (
+            config.get("dp2_data_path")
+            or os.environ.get("RUBIN_DP2_DATA_PATH")
+            or data_path
+        )
 
     if data_path:
         band_map = config.get("band_map", DEFAULT_BAND_MAP)
+        if release == "dp2":
+            return RubinLocalDP2Client(
+                data_path=data_path,
+                visit_path=config.get("visit_path")
+                or os.environ.get("RUBIN_VISIT_PATH"),
+                band_map=band_map,
+                flux_column=config.get("flux_column", "psfFlux"),
+            )
         if use_dia:
             return RubinLocalDiaClient(data_path=data_path, band_map=band_map)
         return RubinLocalClient(data_path=data_path, band_map=band_map)
     else:
+        if release == "dp2":
+            raise ValueError(
+                "The DP2 backend requires a local export; set rubin.dp2_data_path "
+                "(or RUBIN_DP2_DATA_PATH) to the DP2 forced-source parquet file."
+            )
         return RubinTAPClient(config=config)

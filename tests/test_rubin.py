@@ -14,9 +14,11 @@ import pytest
 from scope.surveys.rubin import (
     _flux_to_mag,
     _format_as_kowalski,
+    _format_frame_as_kowalski,
     DEFAULT_BAND_MAP,
     NANOJANSKY_ZP,
     RubinLocalClient,
+    RubinLocalDP2Client,
     make_rubin_client,
 )
 
@@ -552,6 +554,314 @@ class TestRubinLocalClient:
             RubinLocalClient(data_path=str(empty_dir))
 
 
+# --- RubinLocalDP2Client unit tests ---
+
+DP2_PIXEL_FLAGS = {
+    "pixelFlags_bad": False,
+    "pixelFlags_cr": False,
+    "pixelFlags_edge": False,
+    "pixelFlags_saturated": False,
+    "pixelFlags_suspect": False,
+    "invalidPsfFlag": False,
+}
+
+
+def _create_synthetic_dp2_parquet(tmp_path, write_visits=True):
+    """Create a synthetic DP2-style pre-joined parquet export.
+
+    Mimics the real export: no timestamp column, ``diaObjectId``/``ra``/``dec``
+    carried on every row, and each forced-source row duplicated by the
+    DiaSource join.
+    """
+    import pandas as pd
+
+    coords = {
+        2001: (53.10, -28.10),
+        2002: (53.1001, -28.1001),
+        2003: (53.30, -28.10),
+    }
+
+    rows = []
+    for oid, (ra, dec) in coords.items():
+        for visit_id, band, flux in [
+            (100, "g", 1000.0),
+            (200, "g", 1100.0),
+            (300, "r", 900.0),
+        ]:
+            row = {
+                "diaObjectId": oid,
+                "parentObjectId": 0,
+                "visit": visit_id,
+                "detector": 12,
+                "band": band,
+                "psfFlux": flux + oid * 0.1,
+                "psfFluxErr": 50.0,
+                "psfFlux_flag": False,
+                "psfDiffFlux": flux - 1000.0,
+                "psfDiffFluxErr": 55.0,
+                "psfDiffFlux_flag": False,
+                "ra": ra,
+                "dec": dec,
+                **DP2_PIXEL_FLAGS,
+            }
+            # The three-way join emits each epoch three times
+            rows.extend([dict(row) for _ in range(3)])
+
+    # Negative flux epoch, to be dropped by the mag conversion
+    rows.append(
+        {
+            "diaObjectId": 2001,
+            "parentObjectId": 0,
+            "visit": 400,
+            "detector": 12,
+            "band": "i",
+            "psfFlux": -100.0,
+            "psfFluxErr": 10.0,
+            "psfFlux_flag": False,
+            "psfDiffFlux": -100.0,
+            "psfDiffFluxErr": 10.0,
+            "psfDiffFlux_flag": False,
+            "ra": coords[2001][0],
+            "dec": coords[2001][1],
+            **DP2_PIXEL_FLAGS,
+        }
+    )
+
+    # Flagged epoch, kept but with nonzero catflags
+    flagged = {
+        "diaObjectId": 2002,
+        "parentObjectId": 0,
+        "visit": 400,
+        "detector": 12,
+        "band": "i",
+        "psfFlux": 800.0,
+        "psfFluxErr": 40.0,
+        "psfFlux_flag": False,
+        "psfDiffFlux": 10.0,
+        "psfDiffFluxErr": 40.0,
+        "psfDiffFlux_flag": False,
+        "ra": coords[2002][0],
+        "dec": coords[2002][1],
+        **DP2_PIXEL_FLAGS,
+    }
+    flagged["pixelFlags_cr"] = True
+    rows.append(flagged)
+
+    data_file = tmp_path / "VarCands_DP2.parquet"
+    pd.DataFrame(rows).to_parquet(data_file, index=False)
+
+    if write_visits:
+        pd.DataFrame(
+            {
+                "visit": [100, 200, 300, 400],
+                "expMidptMJD": [60000.0, 60001.5, 60002.25, 60003.0],
+            }
+        ).to_parquet(tmp_path / "Visit.parquet", index=False)
+
+    return str(data_file)
+
+
+class TestRubinLocalDP2Client:
+    """Unit tests for RubinLocalDP2Client using a synthetic DP2 export."""
+
+    @pytest.fixture(autouse=True)
+    def setup_data(self, tmp_path):
+        self.tmp_path = tmp_path
+        self.data_file = _create_synthetic_dp2_parquet(tmp_path)
+        self.client = RubinLocalDP2Client(self.data_file)
+
+    def test_accepts_directory(self):
+        """A directory containing the export should resolve to the file."""
+        client = RubinLocalDP2Client(str(self.tmp_path))
+        assert client.data_path == self.data_file
+
+    def test_missing_visit_table_raises(self, tmp_path_factory, monkeypatch):
+        """Without a visit table there is no way to time-stamp epochs."""
+        monkeypatch.delenv("RUBIN_VISIT_PATH", raising=False)
+        other = tmp_path_factory.mktemp("dp2_no_visits")
+        data_file = _create_synthetic_dp2_parquet(other, write_visits=False)
+        with pytest.raises(FileNotFoundError, match="visit table is required"):
+            RubinLocalDP2Client(data_file)
+
+    def test_visit_path_from_env(self, tmp_path_factory, monkeypatch):
+        """RUBIN_VISIT_PATH should be used when no sibling visit table exists."""
+        other = tmp_path_factory.mktemp("dp2_env_visits")
+        data_file = _create_synthetic_dp2_parquet(other, write_visits=False)
+        visit_path = str(self.tmp_path / "Visit.parquet")
+        monkeypatch.setenv("RUBIN_VISIT_PATH", visit_path)
+        client = RubinLocalDP2Client(data_file)
+        assert client.visit_path == visit_path
+
+    def test_bad_flux_column_raises(self):
+        with pytest.raises(ValueError, match="flux_column"):
+            RubinLocalDP2Client(self.data_file, flux_column="apFlux")
+
+    def test_join_duplicates_are_removed(self):
+        """Each (object, visit, detector) should appear exactly once."""
+        self.client._load_forced_sources()
+        fs = self.client._fs_df
+        # 3 objects x 3 epochs + 1 negative-flux + 1 flagged row
+        assert len(fs) == 11
+        assert not fs.duplicated(subset=["objectId", "band", "expMidptMJD"]).any()
+
+    def test_dedupe_can_be_disabled(self):
+        """dedupe=False leaves the raw join duplicates in place."""
+        client = RubinLocalDP2Client(self.data_file, dedupe=False)
+        client._load_forced_sources()
+        assert len(client._fs_df) == 29  # 27 duplicated + 2 singles
+
+    def test_all_objects(self):
+        objects = self.client.get_all_objects()
+        assert set(objects) == {2001, 2002, 2003}
+        assert objects[2001]["coord_ra"] == pytest.approx(53.10)
+        assert objects[2001]["coord_dec"] == pytest.approx(-28.10)
+
+    def test_cone_search(self):
+        """Only objects inside the radius should be returned."""
+        objects = self.client.get_objects_by_cone(53.1, -28.1, 30.0)
+        assert set(objects) == {2001, 2002}
+
+    def test_cone_search_limit(self):
+        objects = self.client.get_objects_by_cone(53.1, -28.1, 30.0, limit=1)
+        assert len(objects) == 1
+
+    def test_lightcurve_format(self):
+        """Output should match the Kowalski format used by the DP1 clients."""
+        lcs = self.client.get_lightcurves([2001])
+        assert len(lcs) == 2  # g and r; the i-band epoch has negative flux
+        by_filter = {lc["filter"]: lc for lc in lcs}
+        assert set(by_filter) == {DEFAULT_BAND_MAP["g"], DEFAULT_BAND_MAP["r"]}
+
+        g_lc = by_filter[DEFAULT_BAND_MAP["g"]]
+        assert g_lc["_id"] == 2001
+        assert len(g_lc["data"]) == 2
+        point = g_lc["data"][0]
+        assert set(point) == {"hjd", "mag", "magerr", "catflags"}
+
+    def test_visit_join_supplies_mjd(self):
+        """Epoch times should come from the visit table, not the visit ID."""
+        lcs = self.client.get_lightcurves([2001], bands=["g"])
+        times = sorted(p["hjd"] for p in lcs[0]["data"])
+        assert times == [60000.0, 60001.5]
+
+    def test_points_are_time_sorted(self):
+        lcs = self.client.get_lightcurves([2001], bands=["g"])
+        times = [p["hjd"] for p in lcs[0]["data"]]
+        assert times == sorted(times)
+
+    def test_magnitude_conversion(self):
+        """Magnitudes should match the nanoJansky AB conversion."""
+        lcs = self.client.get_lightcurves([2001], bands=["g"])
+        point = lcs[0]["data"][0]
+        expected_mag, expected_err = _flux_to_mag(1000.0 + 2001 * 0.1, 50.0)
+        assert point["mag"] == pytest.approx(float(expected_mag))
+        assert point["magerr"] == pytest.approx(float(expected_err))
+
+    def test_negative_flux_dropped(self):
+        """The negative-flux i-band epoch should not appear."""
+        lcs = self.client.get_lightcurves([2001], bands=["i"])
+        assert lcs == []
+
+    def test_pixel_flags_propagate_to_catflags(self):
+        lcs = self.client.get_lightcurves([2002], bands=["i"])
+        assert len(lcs) == 1
+        assert lcs[0]["data"][0]["catflags"] == 1
+
+    def test_band_filter(self):
+        lcs = self.client.get_lightcurves([2001, 2002], bands=["r"])
+        assert {lc["filter"] for lc in lcs} == {DEFAULT_BAND_MAP["r"]}
+
+    def test_empty_objectid_list(self):
+        assert self.client.get_lightcurves([]) == []
+
+    def test_unknown_objectid(self):
+        assert self.client.get_lightcurves([999999]) == []
+
+    def test_diff_flux_column(self):
+        """psfDiffFlux mode should read the difference-image columns."""
+        client = RubinLocalDP2Client(self.data_file, flux_column="psfDiffFlux")
+        lcs = client.get_lightcurves([2001], bands=["g"])
+        # Only the visit-200 epoch has positive psfDiffFlux (1100 - 1000)
+        assert len(lcs) == 1
+        assert len(lcs[0]["data"]) == 1
+        expected_mag, _ = _flux_to_mag(100.0, 55.0)
+        assert lcs[0]["data"][0]["mag"] == pytest.approx(float(expected_mag))
+
+    def test_lightcurves_for_cone(self):
+        objects, lcs = self.client.get_lightcurves_for_cone(53.1, -28.1, 30.0)
+        assert set(objects) == {2001, 2002}
+        assert {lc["_id"] for lc in lcs} == {2001, 2002}
+
+    def test_get_visit_positions(self):
+        visits = self.client.get_visit_positions()
+        assert "expMidptMJD" in visits.columns
+        assert len(visits) == 4
+
+
+class TestFormatFrameAsKowalski:
+    """The vectorized formatter should agree with the row-wise one."""
+
+    def test_matches_row_formatter(self):
+        import pandas as pd
+
+        rows = [
+            {
+                "objectId": 1,
+                "band": "g",
+                "psfFlux": 1000.0,
+                "psfFluxErr": 50.0,
+                "expMidptMJD": 60000.0,
+                "pixelFlags": 0,
+            },
+            {
+                "objectId": 1,
+                "band": "g",
+                "psfFlux": 1100.0,
+                "psfFluxErr": 55.0,
+                "expMidptMJD": 60001.0,
+                "pixelFlags": 2,
+            },
+            {
+                "objectId": 1,
+                "band": "r",
+                "psfFlux": 900.0,
+                "psfFluxErr": 45.0,
+                "expMidptMJD": 60002.0,
+                "pixelFlags": 0,
+            },
+            {
+                "objectId": 2,
+                "band": "g",
+                "psfFlux": -5.0,
+                "psfFluxErr": 45.0,
+                "expMidptMJD": 60002.0,
+                "pixelFlags": 0,
+            },
+        ]
+        expected = _format_as_kowalski(rows)
+        actual = _format_frame_as_kowalski(pd.DataFrame(rows))
+
+        def key(lcs):
+            return {(lc["_id"], lc["filter"]): lc["data"] for lc in lcs}
+
+        assert key(actual) == key(expected)
+
+    def test_empty_frame(self):
+        import pandas as pd
+
+        empty = pd.DataFrame(
+            columns=[
+                "objectId",
+                "band",
+                "psfFlux",
+                "psfFluxErr",
+                "expMidptMJD",
+                "pixelFlags",
+            ]
+        )
+        assert _format_frame_as_kowalski(empty) == []
+
+
 class TestMakeRubinClient:
     """Tests for the make_rubin_client factory function."""
 
@@ -575,6 +885,40 @@ class TestMakeRubinClient:
         client = make_rubin_client({"data_path": str(tmp_path)})
         assert isinstance(client, RubinLocalClient)
         assert client.data_path == str(tmp_path)
+
+    def test_dp2_release_from_config(self, tmp_path):
+        """release='dp2' should select the DP2 client."""
+        data_file = _create_synthetic_dp2_parquet(tmp_path)
+        client = make_rubin_client({"data_path": data_file, "release": "dp2"})
+        assert isinstance(client, RubinLocalDP2Client)
+
+    def test_dp2_release_argument_overrides_config(self, tmp_path):
+        data_file = _create_synthetic_dp2_parquet(tmp_path)
+        client = make_rubin_client({"data_path": data_file}, release="dp2")
+        assert isinstance(client, RubinLocalDP2Client)
+
+    def test_dp2_release_from_env(self, tmp_path, monkeypatch):
+        data_file = _create_synthetic_dp2_parquet(tmp_path)
+        monkeypatch.setenv("RUBIN_RELEASE", "dp2")
+        client = make_rubin_client({"data_path": data_file})
+        assert isinstance(client, RubinLocalDP2Client)
+
+    def test_dp2_flux_column_from_config(self, tmp_path):
+        data_file = _create_synthetic_dp2_parquet(tmp_path)
+        client = make_rubin_client(
+            {"data_path": data_file, "release": "dp2", "flux_column": "psfDiffFlux"}
+        )
+        assert client.flux_column == "psfDiffFlux"
+
+    def test_dp2_without_data_path_raises(self, monkeypatch):
+        """DP2 has no TAP fallback in this client."""
+        monkeypatch.delenv("RUBIN_DATA_PATH", raising=False)
+        with pytest.raises(ValueError, match="requires a local export"):
+            make_rubin_client({"release": "dp2"})
+
+    def test_unknown_release_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="Unknown Rubin release"):
+            make_rubin_client({"data_path": str(tmp_path), "release": "dp3"})
 
 
 # --- Golden reference test using real DP1 data sample ---
@@ -1049,3 +1393,70 @@ class TestIntegrationRubinLocal:
         # Should be monotonically increasing
         assert np.all(np.diff(t_sorted) >= 0)
         assert len(t_sorted) == len(t)
+
+
+# --- Integration tests for the local EDP2/DP2 export ---
+
+DP2_LOCAL_PATH = "/fred/oz480/jfreebur/EDP2/VarCands_DP2.parquet"
+DP2_VISIT_PATH = "/fred/oz480/mcoughli/EDP2/Visit.parquet"
+
+
+@pytest.mark.skipif(
+    not (os.path.isfile(DP2_LOCAL_PATH) and os.path.isfile(DP2_VISIT_PATH)),
+    reason=f"Integration test requires the DP2 export at {DP2_LOCAL_PATH}",
+)
+class TestIntegrationRubinLocalDP2:
+    """Integration tests using the real EDP2 pre-joined parquet export."""
+
+    @pytest.fixture(autouse=True)
+    def setup_client(self):
+        self.client = RubinLocalDP2Client(
+            data_path=DP2_LOCAL_PATH, visit_path=DP2_VISIT_PATH
+        )
+
+    def test_all_objects(self):
+        objects = self.client.get_all_objects()
+        assert len(objects) > 1000
+        first = next(iter(objects.values()))
+        assert "coord_ra" in first
+        assert "coord_dec" in first
+
+    def test_lightcurves_are_well_formed(self):
+        objects = self.client.get_all_objects()
+        objectids = list(objects.keys())[:5]
+        lcs = self.client.get_lightcurves(objectids)
+        assert len(lcs) > 0
+
+        for lc in lcs:
+            assert lc["_id"] in objects
+            assert lc["filter"] in DEFAULT_BAND_MAP.values()
+            times = np.array([p["hjd"] for p in lc["data"]])
+            mags = np.array([p["mag"] for p in lc["data"]])
+            # Time-sorted and inside the DP2 survey window
+            assert np.all(np.diff(times) >= 0)
+            assert times.min() > 60000.0
+            # Individual epochs can scatter arbitrarily faint (forced
+            # photometry on non-detections), but the median must be a
+            # plausible AB magnitude.
+            assert np.all(np.isfinite(mags))
+            assert 10.0 < np.median(mags) < 30.0
+
+    def test_epochs_match_deduplicated_row_count(self):
+        """Retrieved epochs should not carry the SQL join duplication."""
+        import pandas as pd
+
+        objects = self.client.get_all_objects()
+        objectid = next(iter(objects))
+
+        raw = pd.read_parquet(
+            DP2_LOCAL_PATH, columns=["diaObjectId", "visit", "detector", "psfFlux"]
+        )
+        raw = raw[raw["diaObjectId"] == objectid]
+        expected = len(
+            raw[raw["psfFlux"] > 0].drop_duplicates(
+                ["diaObjectId", "visit", "detector"]
+            )
+        )
+
+        lcs = self.client.get_lightcurves([objectid])
+        assert sum(len(lc["data"]) for lc in lcs) == expected

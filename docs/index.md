@@ -26,6 +26,7 @@
 - [Quick Start](getting-started/quickstart.md) -- train your first classifier in minutes
 - [Feature Generation](user-guide/feature-generation.md) -- generate features from ZTF light curves
 - [Rubin DP1](user-guide/rubin-dp1.md) -- process Rubin Data Preview 1 data
+- [Rubin EDP2/DP2](user-guide/rubin-dp2.md) -- process Rubin Early Data Preview 2 DIA photometry
 - [Field Guide](field-guide/index.md) -- learn about the source classes SCoPe identifies
 - [CLI Reference](reference/cli.md) -- all available commands
 

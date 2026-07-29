@@ -27,7 +27,21 @@ kowalski:
 rubin:
   tap_url: https://data.lsst.cloud/api/tap
   token:
+  # Data release to read locally: dp1 (directory of per-table parquet files)
+  # or dp2 (single pre-joined ForcedSourceOnDiaObject export)
+  release: dp1
+  # DP1: directory holding the per-table parquet files
   data_path:
+  # DP2: the pre-joined ForcedSourceOnDiaObject export (falls back to
+  # data_path if unset), so one config can describe both releases
+  dp2_data_path:
+  # DP2 only: visit table mapping visit -> expMidptMJD, since the DP2
+  # forced-source export carries no timestamp. Leave blank to look for
+  # Visit.parquet next to data_path. Create one with:
+  #   python tools/fetch_rubin_visits.py --release dp2 --output <dir>/Visit.parquet
+  visit_path:
+  # DP2 only: psfFlux (direct image, default) or psfDiffFlux (difference image)
+  flux_column: psfFlux
   timeout: 300
   bands: [u, g, r, i, z, y]
   band_map: {u: 0, g: 1, r: 2, i: 3, z: 4, y: 5}
@@ -2413,3 +2427,7 @@ inference:
 # Some fields may already be completed and should be excluded from subsequent feature generation/inference
 fields_to_exclude:
   # - 296
+
+# ATLAS forced photometry server (https://fallingstar-data.com/forcedphot/)
+atlas:
+  token:

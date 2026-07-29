@@ -60,6 +60,7 @@ SCoPe provides a set of command-line tools installed via the `scope-ml` package.
 |---------|-------------|-------------|
 | `get-rubin-ids` | `tools.get_rubin_ids:main` | Discover Rubin object IDs via cone search or read from CSV |
 | `generate-features-rubin` | `tools.generate_features_rubin:main` | Generate SCoPe features for a set of Rubin sources |
+| `fetch-rubin-visits` | `tools.fetch_rubin_visits:main` | Download a Rubin Visit table via TAP (required to time-stamp DP2 forced sources) |
 | `prepare-rubin-chunks` | *(see README)* | Scan local parquet files and split eligible objects into chunk CSVs |
 | `generate-features-rubin-slurm` | *(see README)* | Generate a SLURM array job script from chunk files |
 | `combine-rubin-features` | *(see README)* | Merge per-chunk parquet outputs into a single combined file |

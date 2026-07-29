@@ -14,6 +14,7 @@ Key differences from generate_features.py:
 - Stores coord_ra/coord_dec directly (no GeoJSON 180-degree offset)
 """
 
+import sys
 import scope
 import argparse
 import pathlib
@@ -25,13 +26,17 @@ import warnings
 import json
 import time
 
+# Flush stdout/stderr after every print so SLURM logs update in real time
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 from scope.utils import (
     removeHighCadence,
     write_parquet,
     sort_lightcurve,
     parse_load_config,
 )
-from scope.rubin import make_rubin_client
+from scope.surveys.rubin import make_rubin_client
 from tools.get_rubin_ids import get_rubin_objects_by_cone, get_rubin_objects_from_file
 from tools.featureGeneration import periodsearch
 
@@ -105,7 +110,7 @@ def generate_features_rubin(
     Ncore=8,
     min_n_lc_points=period_search_config.get('min_n_lc_points', 50),
     min_cadence_minutes=period_search_config.get('min_cadence_minutes', 5.0),
-    dirname='generated_features_rubin',
+    dirname='/fred/oz480/mcoughli/generated_features_rubin',
     filename='gen_features_rubin',
     doNotSave=False,
     stop_early=False,
@@ -115,6 +120,9 @@ def generate_features_rubin(
     xmatch_radius_arcsec=2.0,
     phase_bins=period_search_config.get('phase_bins', 20),
     mag_bins=period_search_config.get('mag_bins', 10),
+    use_dia=False,
+    release=None,
+    all_objects=False,
 ):
     """
     Generate features for Rubin LSST light curves.
@@ -172,6 +180,14 @@ def generate_features_rubin(
         Number of phase bins for CE/AOV/FPW.
     mag_bins : int
         Number of magnitude bins for CE.
+    use_dia : bool
+        DP1 only: read DiaObject + ForcedSourceOnDiaObject instead of
+        Object + ForcedSource.
+    release : str, optional
+        Rubin data release to read: 'dp1' (default) or 'dp2'.
+    all_objects : bool
+        DP2 only: process every object in the local export instead of
+        cone-searching or reading an objectId file.
 
     Returns
     -------
@@ -186,13 +202,30 @@ def generate_features_rubin(
     start_dt = utcnow.strftime("%Y-%m-%d %H:%M:%S")
 
     # --- 1. Source Discovery ---
+    # Build the client first so discovery and lightcurve retrieval draw
+    # object IDs from the same tables (DP1 Object, DP1 DIA, or DP2 DIA).
+    rubin_config = config.get("rubin", {})
+    client = make_rubin_client(config=rubin_config, use_dia=use_dia, release=release)
+
     print("Discovering Rubin sources...")
     if objectid_file is not None:
         objects = get_rubin_objects_from_file(objectid_file)
+    elif all_objects:
+        if not hasattr(client, "get_all_objects"):
+            raise ValueError(
+                "--all-objects is only supported by the DP2 backend, whose "
+                "export is already a variability-candidate selection."
+            )
+        objects = client.get_all_objects()
+        print(f"Loaded all {len(objects)} objects from the local export.")
     elif ra is not None and dec is not None:
-        objects = get_rubin_objects_by_cone(ra, dec, radius_arcsec, limit=limit)
+        objects = get_rubin_objects_by_cone(
+            ra, dec, radius_arcsec, limit=limit, client=client
+        )
     else:
-        raise ValueError("Must specify either --ra/--dec or --objectid-file")
+        raise ValueError(
+            "Must specify either --ra/--dec, --objectid-file, or --all-objects"
+        )
 
     if stop_early and len(objects) > limit:
         objectids = list(objects.keys())[:limit]
@@ -204,8 +237,6 @@ def generate_features_rubin(
 
     # --- 2. Lightcurve Retrieval ---
     print(f"Fetching lightcurves for {len(objects)} objects...")
-    rubin_config = config.get("rubin", {})
-    client = make_rubin_client(config=rubin_config)
     objectids = list(objects.keys())
     lcs = client.get_lightcurves(objectids, bands=bands)
 
@@ -231,6 +262,7 @@ def generate_features_rubin(
     feature_dict = {}
     keep_id_list = []
     tme_collection = []
+    band_collection = []
     tme_dict = {}
     baseline = 0
 
@@ -250,26 +282,63 @@ def generate_features_rubin(
 
         # Combine all data points across bands for this object
         all_data = []
+        all_bands = []
         filters_used = set()
         for lc in lc_list:
-            filters_used.add(lc['filter'])
+            filt = lc['filter']
+            filters_used.add(filt)
             # Filter on catflags == 0 (unflagged points)
-            unflagged = [x for x in lc['data'] if x['catflags'] == 0]
-            all_data.extend(unflagged)
+            for x in lc['data']:
+                if x['catflags'] == 0:
+                    all_data.append(x)
+                    all_bands.append(filt)
 
         if len(all_data) == 0:
             continue
 
         tme = [[x['hjd'], x['mag'], x['magerr']] for x in all_data]
+        band_arr = np.array(all_bands, dtype=np.int32)
         try:
             tme_arr = np.array(tme)
             t, m, e = tme_arr.transpose()
 
-            # Sort by time
-            t, m, e = sort_lightcurve(t, m, e)
+            # Sort by time (track band array with same indices)
+            sort_indices = np.argsort(t)
+            t, m, e = t[sort_indices], m[sort_indices], e[sort_indices]
+            band_arr = band_arr[sort_indices]
 
-            # Remove high-cadence duplicates
-            tt, mm, ee = removeHighCadence(t, m, e, cadence_minutes=min_cadence_minutes)
+            # Remove high-cadence duplicates (replicate index logic)
+            hc_idx = []
+            for ii in range(len(t)):
+                if ii == 0:
+                    hc_idx.append(ii)
+                else:
+                    dt = t[ii] - t[hc_idx[-1]]
+                    if dt >= min_cadence_minutes * 60.0 / 86400.0:
+                        hc_idx.append(ii)
+            if len(hc_idx) > 0:
+                tt, mm, ee = t[hc_idx], m[hc_idx], e[hc_idx]
+                bb = band_arr[hc_idx]
+            else:
+                tt, mm, ee = t, m, e
+                bb = band_arr
+
+            # Sigma-clip outliers per band (5-sigma MAD)
+            # Use 5-sigma to only reject catastrophic outliers — these are
+            # variable stars so 3-sigma would clip real variability.
+            clip_mask = np.ones(len(tt), dtype=bool)
+            for b_val in np.unique(bb):
+                b_mask = bb == b_val
+                if b_mask.sum() < 5:
+                    continue
+                med = np.median(mm[b_mask])
+                mad = np.median(np.abs(mm[b_mask] - med))
+                sigma_est = mad * 1.4826  # MAD to Gaussian sigma
+                if sigma_est > 0:
+                    clip_mask[b_mask] &= np.abs(mm[b_mask] - med) < 5.0 * sigma_est
+            if clip_mask.sum() < len(tt):
+                tt, mm, ee = tt[clip_mask], mm[clip_mask], ee[clip_mask]
+                bb = bb[clip_mask]
 
             # Check minimum points
             if len(tt) < min_n_lc_points:
@@ -283,7 +352,8 @@ def generate_features_rubin(
 
             new_tme_arr = np.array([tt, mm, ee])
             tme_collection.append(new_tme_arr)
-            tme_dict[oid] = {'tme': new_tme_arr}
+            tme_dict[oid] = {'tme': new_tme_arr, 'band': bb}
+            band_collection.append(bb)
 
             # Store feature info
             feature_dict[oid] = {}
@@ -341,6 +411,29 @@ def generate_features_rubin(
     for idx, _id in enumerate(id_list_bs):
         for si, name in enumerate(stat_names):
             feature_dict[_id][name] = float(basic_stats_arr[idx, si])
+
+    # --- 4b. Per-Band Statistics ---
+    # Compute per-band weighted std to avoid inflation from chromatic offsets
+    BAND_NAMES = {0: 'u', 1: 'g', 2: 'r', 3: 'i', 4: 'z', 5: 'y'}
+    print("Computing per-band statistics...")
+    for _id in id_list_bs:
+        bb = tme_dict[_id].get('band')
+        tme = tme_dict[_id]['tme']
+        mag, err = tme[1], tme[2]
+        for band_int, band_name in BAND_NAMES.items():
+            if bb is not None:
+                mask = (bb == band_int)
+                n_band = int(mask.sum())
+            else:
+                n_band = 0
+            feature_dict[_id][f'n_{band_name}'] = n_band
+            if n_band >= 3:
+                w = err[mask] ** -2
+                avg = np.average(mag[mask], weights=w)
+                var = np.average((mag[mask] - avg) ** 2, weights=w)
+                feature_dict[_id][f'wstd_{band_name}'] = float(np.sqrt(var))
+            else:
+                feature_dict[_id][f'wstd_{band_name}'] = np.nan
 
     # --- 5. Period Finding ---
     if doScaleMinPeriod:
@@ -444,14 +537,13 @@ def generate_features_rubin(
 
             for algorithm, algo_run in zip(pa, pa_run):
                 print(f'Running {algo_run} algorithm:')
+                batch_sl = slice(
+                    i * period_batch_size,
+                    min(n_sources, (i + 1) * period_batch_size),
+                )
                 periods, significances, pdots = periodsearch.find_periods(
                     algo_run,
-                    tme_collection[
-                        i
-                        * period_batch_size : min(
-                            n_sources, (i + 1) * period_batch_size
-                        )
-                    ],
+                    tme_collection[batch_sl],
                     freqs,
                     doGPU=doGPU,
                     doCPU=doCPU,
@@ -462,6 +554,7 @@ def generate_features_rubin(
                     phase_bins=phase_bins,
                     mag_bins=mag_bins,
                     Ncore=Ncore,
+                    bands=band_collection[batch_sl],
                 )
 
                 if not do_nested_algorithms:
@@ -674,6 +767,193 @@ def generate_features_rubin(
         # Single-period mode: no top-N columns
         do_top_n = False
 
+    # --- 5c. Matched filter morphology scores ---
+    if doCPU or doGPU:
+        print('Computing matched filter morphology scores...')
+
+        def _sawtooth_tmpl(phase, rise_frac, offset):
+            p = (phase - offset) % 1.0
+            return np.where(
+                p < rise_frac,
+                -1 + 2 * p / rise_frac,
+                1 - 2 * (p - rise_frac) / (1 - rise_frac),
+            )
+
+        def _sinusoidal_tmpl(phase, offset):
+            return np.sin(2 * np.pi * (phase - offset))
+
+        def _eclipsing_tmpl(phase, dip_width, offset, secondary):
+            p = (phase - offset) % 1.0
+            val = np.zeros_like(p)
+            val[(np.abs(p) < dip_width / 2) | (np.abs(p - 1) < dip_width / 2)] = -1.0
+            if secondary:
+                val[np.abs(p - 0.5) < dip_width / 2] = -0.5
+            return val
+
+        _offsets = np.linspace(0, 1, 20, endpoint=False)
+        _rise_fracs = [0.10, 0.15, 0.20, 0.25, 0.30]
+        _dip_widths = [0.05, 0.10, 0.15, 0.20]
+        N_MF_BINS = 20
+
+        _zero_mf = {
+            'mf_sawtooth': 0.0,
+            'mf_sinusoidal': 0.0,
+            'mf_eclipsing': 0.0,
+            'mf_R2': 0.0,
+            'mf_amp_snr': 0.0,
+            'mf_n_filled': 0,
+            'mf_combined': 0.0,
+        }
+
+        algo_names_mf = []
+        for algorithm in pa:
+            if algorithm not in ["ELS_ECE_EAOV", "LS_CE_AOV"]:
+                algo_names_mf.append(algorithm.split('_')[0])
+            else:
+                algo_names_mf.append(algorithm)
+
+        for _id in keep_id_list:
+            tme = tme_dict[_id]['tme']
+            bb = tme_dict[_id].get('band')
+            t_arr, m_arr, e_arr = tme[0], tme[1], tme[2]
+            w_all = e_arr ** -2
+
+            # Per-band median subtraction to remove chromatic offsets
+            m_corr = m_arr.copy()
+            if bb is not None:
+                for b_int in np.unique(bb):
+                    bmask = bb == b_int
+                    if bmask.sum() >= 2:
+                        m_corr[bmask] -= np.median(m_arr[bmask])
+            else:
+                m_corr -= np.median(m_arr)
+
+            # Total weighted variance (used for R² computation)
+            wmean_all = np.average(m_corr, weights=w_all)
+            total_var = np.average((m_corr - wmean_all) ** 2, weights=w_all)
+
+            for aname in algo_names_mf:
+                period = feature_dict[_id].get(f'period_{aname}', 0)
+                if period <= 0 or np.isnan(period) or len(t_arr) < 10:
+                    for key, val in _zero_mf.items():
+                        feature_dict[_id][f'{key}_{aname}'] = val
+                    continue
+
+                phase = (t_arr / period) % 1.0
+                bin_edges = np.linspace(0, 1, N_MF_BINS + 1)
+                bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+                binned = np.full(N_MF_BINS, np.nan)
+                within_rms_list = []
+                within_var_sum = 0.0
+                within_w_sum = 0.0
+                n_filled = 0
+
+                for i in range(N_MF_BINS):
+                    mask = (phase >= bin_edges[i]) & (phase < bin_edges[i + 1])
+                    if mask.sum() >= 2:
+                        w = e_arr[mask] ** -2
+                        avg = np.average(m_corr[mask], weights=w)
+                        binned[i] = avg
+                        var = np.average((m_corr[mask] - avg) ** 2, weights=w)
+                        within_rms_list.append(np.sqrt(var))
+                        within_var_sum += var * w.sum()
+                        within_w_sum += w.sum()
+                        n_filled += 1
+
+                valid = ~np.isnan(binned)
+                if n_filled < N_MF_BINS * 0.5 or total_var < 1e-20:
+                    for key, val in _zero_mf.items():
+                        feature_dict[_id][f'{key}_{aname}'] = val
+                    continue
+
+                bm = binned[valid]
+                bc = bin_centers[valid]
+                bm_std = bm.std()
+                if bm_std < 1e-10:
+                    for key, val in _zero_mf.items():
+                        feature_dict[_id][f'{key}_{aname}'] = val
+                    continue
+                bm_n = (bm - bm.mean()) / bm_std
+
+                # R² = variance reduction from phase folding
+                within_var = (
+                    within_var_sum / within_w_sum if within_w_sum > 0
+                    else total_var
+                )
+                r2 = float(max(1.0 - within_var / total_var, 0.0))
+
+                # Amplitude SNR = binned peak-to-peak / mean within-bin RMS
+                amp = float(bm.max() - bm.min())
+                mean_rms = (
+                    float(np.mean(within_rms_list)) if within_rms_list
+                    else 1.0
+                )
+                amp_snr = amp / mean_rms if mean_rms > 1e-10 else 0.0
+
+                # Sawtooth correlation
+                best_saw = -1.0
+                for off in _offsets:
+                    for rf in _rise_fracs:
+                        tmpl = _sawtooth_tmpl(bc, rf, off)
+                        ts = tmpl.std()
+                        if ts > 1e-10:
+                            best_saw = max(
+                                best_saw,
+                                np.corrcoef(
+                                    (tmpl - tmpl.mean()) / ts, bm_n
+                                )[0, 1],
+                            )
+                feature_dict[_id][f'mf_sawtooth_{aname}'] = float(
+                    max(best_saw, 0.0)
+                )
+
+                # Sinusoidal correlation
+                best_sin = -1.0
+                for off in _offsets:
+                    tmpl = _sinusoidal_tmpl(bc, off)
+                    ts = tmpl.std()
+                    if ts > 1e-10:
+                        best_sin = max(
+                            best_sin,
+                            np.corrcoef(
+                                (tmpl - tmpl.mean()) / ts, bm_n
+                            )[0, 1],
+                        )
+                feature_dict[_id][f'mf_sinusoidal_{aname}'] = float(
+                    max(best_sin, 0.0)
+                )
+
+                # Eclipsing correlation
+                best_ecl = -1.0
+                for off in _offsets:
+                    for dw in _dip_widths:
+                        for sec in [True, False]:
+                            tmpl = _eclipsing_tmpl(bc, dw, off, sec)
+                            ts = tmpl.std()
+                            if ts > 1e-10:
+                                best_ecl = max(
+                                    best_ecl,
+                                    np.corrcoef(
+                                        (tmpl - tmpl.mean()) / ts, bm_n
+                                    )[0, 1],
+                                )
+                feature_dict[_id][f'mf_eclipsing_{aname}'] = float(
+                    max(best_ecl, 0.0)
+                )
+
+                # Store R², amplitude SNR, phase coverage, combined score
+                feature_dict[_id][f'mf_R2_{aname}'] = r2
+                feature_dict[_id][f'mf_amp_snr_{aname}'] = float(amp_snr)
+                feature_dict[_id][f'mf_n_filled_{aname}'] = n_filled
+                best_corr = max(best_saw, best_sin, best_ecl, 0.0)
+                coverage = n_filled / N_MF_BINS
+                feature_dict[_id][f'mf_combined_{aname}'] = float(
+                    best_corr * r2 * coverage
+                )
+
+        print(f'  Matched filter scores computed for {len(keep_id_list)} sources '
+              f'x {len(algo_names_mf)} algorithms')
+
     # --- 6. Fourier Statistics ---
     print(f'Computing Fourier stats for {len(period_dict)} algorithms...')
     id_list = list(tme_dict.keys())
@@ -716,6 +996,86 @@ def generate_features_rubin(
                 feature_dict[_id][f'{name}_{algorithm_name}'] = float(
                     fourier_features[idx, i]
                 )
+
+    # --- 6a. MHF per-K BIC morphology features ---
+    # Evaluate per-harmonic ΔBIC at each algorithm's best period.
+    # This discriminates sinusoidal (K=1 dominant) from non-sinusoidal
+    # (K≥2 dominant) shapes without re-running the full periodogram.
+    if doCPU or doGPU:
+        MHF_MAX_K = 5
+        mhf_per_k_names = [f'mhf_dbic_k{k}' for k in range(MHF_MAX_K + 1)] + ['mhf_best_k']
+
+        print(f'Computing MHF per-K BIC features (max_harmonics={MHF_MAX_K})...')
+        id_list_mhf = list(tme_dict.keys())
+        lightcurves_mhf = [tme_dict[_id]['tme'] for _id in id_list_mhf]
+
+        for algorithm in pa:
+            if algorithm not in ["ELS_ECE_EAOV", "LS_CE_AOV"]:
+                algorithm_name = algorithm.split('_')[0]
+            else:
+                algorithm_name = algorithm
+            print(f'  - MHF per-K at {algorithm_name} periods')
+
+            periods_for_algo = np.array(
+                [tme_dict[_id][f'period_{algorithm_name}'] for _id in id_list_mhf],
+                dtype=np.float32,
+            )
+
+            per_k_features = periodsearch.compute_mhf_per_k_features(
+                lightcurves_mhf, periods_for_algo, max_harmonics=MHF_MAX_K,
+                bands=[tme_dict[_id].get('band') for _id in id_list_mhf],
+            )
+
+            for idx, _id in enumerate(id_list_mhf):
+                for i, name in enumerate(mhf_per_k_names):
+                    feature_dict[_id][f'{name}_{algorithm_name}'] = float(
+                        per_k_features[idx, i]
+                    )
+                # Derived ratios (morphology discriminators)
+                dbic_k1 = float(per_k_features[idx, 1])
+                dbic_k3 = float(per_k_features[idx, 3]) if MHF_MAX_K >= 3 else 0.0
+                dbic_k5 = float(per_k_features[idx, 5]) if MHF_MAX_K >= 5 else 0.0
+                feature_dict[_id][f'mhf_k3_over_k1_{algorithm_name}'] = (
+                    dbic_k3 / dbic_k1 if dbic_k1 > 0 else 0.0
+                )
+                feature_dict[_id][f'mhf_k5_over_k1_{algorithm_name}'] = (
+                    dbic_k5 / dbic_k1 if dbic_k1 > 0 else 0.0
+                )
+
+    # --- 6b. Sidereal-alias family scoring ---
+    if do_top_n and top_n_periods_dict:
+        print('Computing sidereal-alias family scores...')
+
+        # Build f1_power lookup per algorithm
+        f1_power_dict = {}
+        for algorithm in pa:
+            if algorithm not in top_n_periods_dict:
+                continue
+            aname = (
+                algorithm
+                if algorithm in ("ELS_ECE_EAOV", "LS_CE_AOV")
+                else algorithm.split('_')[0]
+            )
+            f1_arr = np.array(
+                [
+                    feature_dict[_id].get(f'f1_power_{aname}', np.nan)
+                    for _id in keep_id_list
+                ]
+            )
+            f1_power_dict[algorithm] = f1_arr
+
+        family_scores = periodsearch.compute_sidereal_family_scores(
+            top_n_periods_dict=top_n_periods_dict,
+            top_n_sigs_dict=top_n_sigs_dict,
+            keep_id_list=keep_id_list,
+            period_algorithms=pa,
+            f1_power_dict=f1_power_dict,
+            period_dict=period_dict,
+        )
+
+        for _id, fscores in family_scores.items():
+            for key, val in fscores.items():
+                feature_dict[_id][key] = val
 
     # --- 7. dmdt Histograms ---
     print('Computing dmdt histograms...')
@@ -806,16 +1166,19 @@ def _save_results(
 
         meta_filename = dirpath / "meta.json"
         if os.path.exists(meta_filename):
-            with open(meta_filename, 'r') as f:
-                dct = json.load(f)
-                dct.update(meta_dct)
-                meta_dct = dct
-
-        with open(meta_filename, 'w') as f:
             try:
+                with open(meta_filename, 'r') as f:
+                    dct = json.load(f)
+                    dct.update(meta_dct)
+                    meta_dct = dct
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"Warning: could not read {meta_filename}, overwriting: {e}")
+
+        try:
+            with open(meta_filename, 'w') as f:
                 json.dump(meta_dct, f)
-            except Exception as e:
-                print("error dumping to json, message: ", e)
+        except OSError as e:
+            print(f"Warning: could not write {meta_filename}: {e}")
 
         filepath = dirpath / filename
         write_parquet(feature_df, str(filepath))
@@ -935,7 +1298,7 @@ def get_parser(**kwargs):
     parser.add_argument(
         "--dirname",
         type=str,
-        default='generated_features_rubin',
+        default='/fred/oz480/mcoughli/generated_features_rubin',
         help="Directory name for generated features",
     )
     parser.add_argument(
@@ -980,12 +1343,37 @@ def get_parser(**kwargs):
         default=2.0,
         help="Cross-match radius in arcseconds",
     )
+    parser.add_argument(
+        "--use-dia",
+        action='store_true',
+        default=False,
+        help="Use DiaObject + ForcedSourceOnDiaObject tables (all DP1 fields, no isolation filter)",
+    )
+    parser.add_argument(
+        "--release",
+        type=str,
+        default=None,
+        help="Rubin data release to read: dp1 (default) or dp2",
+    )
+    parser.add_argument(
+        "--all-objects",
+        action='store_true',
+        default=False,
+        help="DP2 only: process every object in the local export",
+    )
     return parser
 
 
 def main():
     parser = get_parser()
     args, _ = parser.parse_known_args()
+
+    # DIA data should not filter out high-cadence points by default
+    # (the DP2 export is DIA forced photometry by construction)
+    is_dia = args.use_dia or str(args.release or '').lower() == 'dp2'
+    min_cadence = args.min_cadence_minutes
+    if is_dia and min_cadence == period_search_config.get('min_cadence_minutes', 5.0):
+        min_cadence = 0.0
 
     generate_features_rubin(
         ra=args.ra,
@@ -1002,7 +1390,7 @@ def main():
         doRemoveTerrestrial=args.doRemoveTerrestrial,
         Ncore=args.Ncore,
         min_n_lc_points=args.min_n_lc_points,
-        min_cadence_minutes=args.min_cadence_minutes,
+        min_cadence_minutes=min_cadence,
         dirname=args.dirname,
         filename=args.filename,
         doNotSave=args.doNotSave,
@@ -1013,6 +1401,9 @@ def main():
         xmatch_radius_arcsec=args.xmatch_radius_arcsec,
         phase_bins=args.phase_bins,
         mag_bins=args.mag_bins,
+        use_dia=args.use_dia,
+        release=args.release,
+        all_objects=args.all_objects,
     )
 
 
