@@ -32,7 +32,7 @@ from scope.utils import (
 )
 from scope.surveys.rubin import make_rubin_client
 from tools.get_rubin_ids import get_rubin_objects_by_cone, get_rubin_objects_from_file
-from tools.featureGeneration import periodsearch
+from tools.featureGeneration import periodsearch, pdrs, drw
 
 # Flush stdout/stderr after every print so SLURM logs update in real time
 sys.stdout.reconfigure(line_buffering=True)
@@ -51,6 +51,8 @@ dmdt_ints = config['feature_generation']['dmdt_ints']
 period_algorithms = config['feature_generation']['period_algorithms']
 path_to_features = config['feature_generation']['path_to_features']
 period_search_config = config['feature_generation'].get('period_search', {})
+pdrs_params = config['feature_generation'].get('pdrs', {})
+drw_params = config['feature_generation'].get('drw', {})
 
 if path_to_features is not None:
     BASE_DIR = pathlib.Path(path_to_features)
@@ -110,6 +112,8 @@ def generate_features_rubin(
     min_cadence_minutes=period_search_config.get('min_cadence_minutes', 5.0),
     dirname='/fred/oz480/mcoughli/generated_features_rubin',
     filename='gen_features_rubin',
+    doFlareDetection=False,
+    doDRW=False,
     doNotSave=False,
     stop_early=False,
     limit=10000,
@@ -161,6 +165,12 @@ def generate_features_rubin(
         Output directory name.
     filename : str
         Output filename prefix.
+    doFlareDetection : bool
+        Compute PDRS flare/high-activity segmentation features, per band
+        (n_flares_g, flare_significance_g, flare_duty_cycle_g, ...).
+    doDRW : bool
+        Fit damped-random-walk models and compute DRW anomaly features, per
+        band (drw_tau_g, drw_sigma_g, drw_max_z_g, drw_fit_success_g, ...).
     doNotSave : bool
         Skip saving output.
     stop_early : bool
@@ -432,6 +442,45 @@ def generate_features_rubin(
                 feature_dict[_id][f'wstd_{band_name}'] = float(np.sqrt(var))
             else:
                 feature_dict[_id][f'wstd_{band_name}'] = np.nan
+
+    # --- 4c. AGN / Anomaly Features (per band) ---
+    # Computed per band rather than on the merged multi-band curve: Rubin's
+    # native schema is per band throughout (cf. section 4b), and fitting a
+    # merged curve would read chromatic offsets and per-band amplitude
+    # differences as intrinsic variability, biasing drw_sigma high.
+    # Both modules gate internally on epoch count and return NaN-valued dicts
+    # for curves that are too short, so every source gets the same columns
+    # regardless of band coverage. The epoch floor is config-tunable via
+    # feature_generation.drw.min_epochs and feature_generation.pdrs.
+    if doFlareDetection:
+        print(f'Computing PDRS flare features for {len(id_list_bs)} sources...')
+        for band_int, band_name in BAND_NAMES.items():
+            for _id in id_list_bs:
+                bb = tme_dict[_id].get('band')
+                tme = tme_dict[_id]['tme']
+                tme_band = tme[:, bb == band_int] if bb is not None else tme[:, :0]
+                pdrs_stats = pdrs.calc_pdrs_stats(tme_band, **pdrs_params)
+                for key, val in pdrs_stats.items():
+                    feature_dict[_id][f'{key}_{band_name}'] = val
+
+    if doDRW:
+        print(f'Computing DRW features for {len(id_list_bs)} sources...')
+        for band_int, band_name in BAND_NAMES.items():
+            band_lcs = []
+            for _id in id_list_bs:
+                bb = tme_dict[_id].get('band')
+                tme = tme_dict[_id]['tme']
+                band_lcs.append(
+                    tme[:, bb == band_int] if bb is not None else tme[:, :0]
+                )
+            drw_stats_list = drw.calc_drw_stats_batch(
+                band_lcs,
+                Ncore=Ncore,
+                **drw_params,
+            )
+            for _id, drw_stats in zip(id_list_bs, drw_stats_list):
+                for key, val in drw_stats.items():
+                    feature_dict[_id][f'{key}_{band_name}'] = val
 
     # --- 5. Period Finding ---
     if doScaleMinPeriod:
@@ -1296,6 +1345,18 @@ def get_parser(**kwargs):
         help="Prefix for generated feature file",
     )
     parser.add_argument(
+        "--doFlareDetection",
+        action='store_true',
+        default=False,
+        help="Compute per-band PDRS flare/high-activity segmentation features",
+    )
+    parser.add_argument(
+        "--doDRW",
+        action='store_true',
+        default=False,
+        help="Fit per-band damped-random-walk models and compute DRW anomaly features",
+    )
+    parser.add_argument(
         "--doNotSave",
         action='store_true',
         default=False,
@@ -1381,6 +1442,8 @@ def main():
         min_cadence_minutes=min_cadence,
         dirname=args.dirname,
         filename=args.filename,
+        doFlareDetection=args.doFlareDetection,
+        doDRW=args.doDRW,
         doNotSave=args.doNotSave,
         stop_early=args.stop_early,
         limit=args.query_size_limit,
