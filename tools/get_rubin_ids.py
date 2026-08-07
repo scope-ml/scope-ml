@@ -11,7 +11,7 @@ import os
 import pathlib
 import pandas as pd
 from scope.utils import parse_load_config
-from scope.rubin import make_rubin_client
+from scope.surveys.rubin import make_rubin_client
 
 BASE_DIR = pathlib.Path.cwd()
 config = parse_load_config()
