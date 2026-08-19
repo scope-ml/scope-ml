@@ -3,7 +3,7 @@ import argparse
 import json as JSON
 import pandas as pd
 from penquins import Kowalski
-from scope.fritz import save_newsource, api, radec_to_iau_name
+from scope.surveys.fritz import save_newsource, api, radec_to_iau_name
 from scope.utils import (
     read_hdf,
     read_parquet,

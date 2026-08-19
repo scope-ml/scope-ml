@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 import pandas as pd
 from penquins import Kowalski
-from scope.fritz import get_lightcurves_via_ids, radec_to_iau_name
+from scope.surveys.fritz import get_lightcurves_via_ids, radec_to_iau_name
 from tools.get_quad_ids import get_cone_ids
 from scope.utils import (
     read_parquet,

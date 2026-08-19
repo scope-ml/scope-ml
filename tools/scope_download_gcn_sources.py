@@ -6,7 +6,7 @@ from penquins import Kowalski
 from datetime import datetime, timedelta
 import numpy as np
 import json
-from scope.fritz import api
+from scope.surveys.fritz import api
 from tools.get_quad_ids import get_cone_ids
 from scope.utils import write_parquet, parse_load_config
 

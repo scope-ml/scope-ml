@@ -1,7 +1,7 @@
 import pandas as pd
 from penquins import Kowalski
 import numpy as np
-from scope.fritz import get_highscoring_objects, get_stats
+from scope.surveys.fritz import get_highscoring_objects, get_stats
 import argparse
 import csv
 import json
