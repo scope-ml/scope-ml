@@ -228,11 +228,9 @@ class TestDRW:
                 else:
                     assert b[key] == s[key]
 
-
-# ---------------------------------------------------------------------------
-# TestEVT
-# ---------------------------------------------------------------------------
-
+    # ---------------------------------------------------------------------------
+    # TestEVT
+    # ---------------------------------------------------------------------------
 
     def test_unconstrained_fit_is_not_flagged_success(self):
         """A fit that runs to a parameter bound must not report success.
@@ -331,11 +329,9 @@ class TestEVT:
         with pytest.raises(ValueError):
             evt.fit_gpd(np.ones(10))
 
-
-# ---------------------------------------------------------------------------
-# End-to-end: DRW max_z of a flaring source stands out after calibration
-# ---------------------------------------------------------------------------
-
+    # ---------------------------------------------------------------------------
+    # End-to-end: DRW max_z of a flaring source stands out after calibration
+    # ---------------------------------------------------------------------------
 
     def test_detects_wide_and_long_layouts(self):
         """EVT must recognise the Rubin wide layout, not just the ZTF long one.
@@ -348,14 +344,17 @@ class TestEVT:
         filter.
         """
         wide_cols = [
-            '_id', 'n_g', 'drw_tau_g', 'drw_max_z_g', 'drw_max_z_r',
-            'drw_max_z_i', 'n_flares_g',
+            '_id',
+            'n_g',
+            'drw_tau_g',
+            'drw_max_z_g',
+            'drw_max_z_r',
+            'drw_max_z_i',
+            'n_flares_g',
         ]
         mapping, layout = evt.max_z_layout(wide_cols)
         assert layout == 'wide'
-        assert mapping == {
-            'g': 'drw_max_z_g', 'r': 'drw_max_z_r', 'i': 'drw_max_z_i'
-        }
+        assert mapping == {'g': 'drw_max_z_g', 'r': 'drw_max_z_r', 'i': 'drw_max_z_i'}
 
         long_cols = ['_id', 'filter', 'drw_tau', 'drw_max_z', 'n_flares']
         mapping, layout = evt.max_z_layout(long_cols)
@@ -370,18 +369,19 @@ class TestEVT:
         """A wide table must yield one calibration per band, not one pooled."""
         rng = np.random.default_rng(3)
         n = 400
-        frame = pd.DataFrame({
-            '_id': np.arange(n),
-            # deliberately different scales per band
-            'drw_max_z_g': np.abs(rng.normal(0.0, 1.0, n)) + 3.0,
-            'drw_max_z_r': np.abs(rng.normal(0.0, 2.0, n)) + 6.0,
-        })
+        frame = pd.DataFrame(
+            {
+                '_id': np.arange(n),
+                # deliberately different scales per band
+                'drw_max_z_g': np.abs(rng.normal(0.0, 1.0, n)) + 3.0,
+                'drw_max_z_r': np.abs(rng.normal(0.0, 2.0, n)) + 6.0,
+            }
+        )
         mapping, layout = evt.max_z_layout(frame.columns)
         assert layout == 'wide'
 
         calibs = {
-            band: evt.fit_gpd(frame[col].to_numpy())
-            for band, col in mapping.items()
+            band: evt.fit_gpd(frame[col].to_numpy()) for band, col in mapping.items()
         }
         assert set(calibs) == {'g', 'r'}
         # the r band sits higher, so its POT threshold must too

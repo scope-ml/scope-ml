@@ -335,9 +335,9 @@ def main():
                 z = df[col].values.astype(float)
                 finite = np.isfinite(z)
                 band_flag = np.full(z.shape, np.nan)
-                band_flag[finite] = (
-                    z[finite] > calib['detection_threshold']
-                ).astype(float)
+                band_flag[finite] = (z[finite] > calib['detection_threshold']).astype(
+                    float
+                )
                 df[f'anomaly_score_{band}'] = anomaly_score(z, calib)
                 df[f'anomaly_flag_{band}'] = band_flag
             df.to_parquet(path, index=False)
