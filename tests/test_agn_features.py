@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
 
 import json  # noqa: E402
 import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
 import pdrs  # noqa: E402
 import drw  # noqa: E402
@@ -227,10 +228,45 @@ class TestDRW:
                 else:
                     assert b[key] == s[key]
 
+    # ---------------------------------------------------------------------------
+    # TestEVT
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# TestEVT
-# ---------------------------------------------------------------------------
+    def test_unconstrained_fit_is_not_flagged_success(self):
+        """A fit that runs to a parameter bound must not report success.
+
+        scipy reports convergence even when the optimum sits against a
+        bound, so on a baseline too short to show the DRW turnover every
+        fit came back drw_fit_success = 1 with tau pinned at a rail. The
+        flag has to distinguish converged from constrained, or anything
+        filtering on it downstream gets meaningless tau and sigma.
+        """
+        # A pure white-noise curve: there is no damping timescale to find,
+        # so the fit has nothing to constrain tau with.
+        rng = np.random.default_rng(1)
+        n = 120
+        times = np.sort(rng.uniform(0.0, 200.0, n))
+        magerrs = np.full(n, 0.02)
+        mags = 20.0 + rng.normal(0.0, 0.02, n)
+
+        stats = drw.calc_drw_stats((times, mags, magerrs))
+
+        baseline = times[-1] - times[0]
+        constrained = drw._fit_is_constrained(
+            stats['drw_tau'], stats['drw_sigma'], times
+        )
+        assert stats['drw_fit_success'] == int(constrained)
+        if not constrained:
+            # the parameters are still reported, as limits
+            assert np.isfinite(stats['drw_tau'])
+            assert np.isfinite(stats['drw_max_z'])
+
+        # An explicitly out-of-range tau is never constrained
+        assert not drw._fit_is_constrained(10.0 * baseline, 0.1, times)
+        assert not drw._fit_is_constrained(1e-6, 0.1, times)
+        assert not drw._fit_is_constrained(0.5 * baseline, 1e-8, times)
+        # ... while a sane one is
+        assert drw._fit_is_constrained(0.1 * baseline, 0.1, times)
 
 
 class TestEVT:
@@ -293,10 +329,63 @@ class TestEVT:
         with pytest.raises(ValueError):
             evt.fit_gpd(np.ones(10))
 
+    # ---------------------------------------------------------------------------
+    # End-to-end: DRW max_z of a flaring source stands out after calibration
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# End-to-end: DRW max_z of a flaring source stands out after calibration
-# ---------------------------------------------------------------------------
+    def test_detects_wide_and_long_layouts(self):
+        """EVT must recognise the Rubin wide layout, not just the ZTF long one.
+
+        #586 wrote evt_calibration.py against the ZTF feature tables: one row
+        per source-band, a single drw_max_z column, and a filter column to
+        group on. #587 emits one row per source with drw_max_z_<band>, so
+        the tool matched no files and exited without scoring anything. Both
+        layouts have to resolve, and the long path must keep grouping by
+        filter.
+        """
+        wide_cols = [
+            '_id',
+            'n_g',
+            'drw_tau_g',
+            'drw_max_z_g',
+            'drw_max_z_r',
+            'drw_max_z_i',
+            'n_flares_g',
+        ]
+        mapping, layout = evt.max_z_layout(wide_cols)
+        assert layout == 'wide'
+        assert mapping == {'g': 'drw_max_z_g', 'r': 'drw_max_z_r', 'i': 'drw_max_z_i'}
+
+        long_cols = ['_id', 'filter', 'drw_tau', 'drw_max_z', 'n_flares']
+        mapping, layout = evt.max_z_layout(long_cols)
+        assert layout == 'long'
+        assert mapping == {'all': 'drw_max_z'}
+
+        mapping, layout = evt.max_z_layout(['_id', 'median', 'wstd'])
+        assert layout is None
+        assert mapping == {}
+
+    def test_wide_layout_calibrates_each_band_separately(self):
+        """A wide table must yield one calibration per band, not one pooled."""
+        rng = np.random.default_rng(3)
+        n = 400
+        frame = pd.DataFrame(
+            {
+                '_id': np.arange(n),
+                # deliberately different scales per band
+                'drw_max_z_g': np.abs(rng.normal(0.0, 1.0, n)) + 3.0,
+                'drw_max_z_r': np.abs(rng.normal(0.0, 2.0, n)) + 6.0,
+            }
+        )
+        mapping, layout = evt.max_z_layout(frame.columns)
+        assert layout == 'wide'
+
+        calibs = {
+            band: evt.fit_gpd(frame[col].to_numpy()) for band, col in mapping.items()
+        }
+        assert set(calibs) == {'g', 'r'}
+        # the r band sits higher, so its POT threshold must too
+        assert calibs['r']['u'] > calibs['g']['u']
 
 
 class TestEndToEnd:

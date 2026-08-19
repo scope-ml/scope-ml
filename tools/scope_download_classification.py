@@ -3,7 +3,7 @@ import argparse
 import pathlib
 import pandas as pd
 import pkg_resources
-from scope.fritz import api
+from scope.surveys.fritz import api
 from scope.utils import (
     read_hdf,
     write_hdf,

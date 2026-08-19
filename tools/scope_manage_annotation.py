@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 import argparse
 import pandas as pd
-from scope.fritz import api
+from scope.surveys.fritz import api
 
 
 def manage_annotation(action, source, group_ids, origin, key, value):

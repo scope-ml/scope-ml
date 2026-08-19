@@ -11,6 +11,11 @@ a generalized Pareto distribution (GPD) to the tail via peaks-over-threshold
     anomaly_flag   1 if drw_max_z exceeds the detection threshold derived
                    from the target false-alarm rate, else 0
 
+Handles both feature layouts: the ZTF long form (one row per source-band with
+a single drw_max_z and a filter column) and the Rubin wide form (one row per
+source with drw_max_z_<band> per band), writing anomaly_score_<band> and
+anomaly_flag_<band> in the latter case.
+
 Calibration is performed per filter (per ZTF band) by default and saved to a
 JSON file so that later runs can score new sources against the same frozen
 threshold. By default the tool only reports; pass --apply to write the
@@ -131,15 +136,45 @@ def anomaly_score(z, calib):
     return score
 
 
+BANDS = ('u', 'g', 'r', 'i', 'z', 'y')
+
+
+def max_z_layout(columns):
+    """Identify how drw_max_z is stored in a feature table.
+
+    Two layouts exist in scope-ml:
+
+    long (ZTF, #586)
+        one row per source-band; a single ``drw_max_z`` column plus a
+        ``filter`` column identifying the band.
+    wide (Rubin, #587)
+        one row per source; ``drw_max_z_<band>`` for each band, because
+        Rubin features are computed per band to avoid chromatic offsets.
+
+    Returns ``(mapping, layout)`` where mapping is {group_key: column} and
+    layout is 'wide', 'long' or None.
+    """
+    cols = set(columns)
+    per_band = {b: f'drw_max_z_{b}' for b in BANDS if f'drw_max_z_{b}' in cols}
+    if per_band:
+        return per_band, 'wide'
+    if 'drw_max_z' in cols:
+        return {'all': 'drw_max_z'}, 'long'
+    return {}, None
+
+
 def collect_feature_files(features_dir, pattern):
     paths = sorted(pathlib.Path(features_dir).rglob(pattern))
     usable = []
     for path in paths:
         try:
-            columns = pd.read_parquet(path, columns=['drw_max_z']).columns
+            import pyarrow.parquet as pq
+
+            columns = pq.ParquetFile(path).schema_arrow.names
         except Exception:
             continue
-        if 'drw_max_z' in columns:
+        mapping, _ = max_z_layout(columns)
+        if mapping:
             usable.append(path)
     return usable
 
@@ -223,17 +258,35 @@ def main():
     frames = [pd.read_parquet(path) for path in paths]
     pooled = pd.concat(frames, ignore_index=True)
 
-    per_filter = (not args.no_per_filter) and ('filter' in pooled.columns)
-    if per_filter:
-        groups = {
-            int(flt): grp['drw_max_z'].values for flt, grp in pooled.groupby('filter')
-        }
+    colmap, layout = max_z_layout(pooled.columns)
+    if layout == 'wide':
+        # One calibration per band. Pooling bands would mix different
+        # photometric depths into a single tail fit.
+        if args.no_per_filter:
+            stacked = np.concatenate(
+                [pooled[c].values.astype(float) for c in colmap.values()]
+            )
+            groups = {'all': stacked}
+            per_filter = False
+        else:
+            groups = {b: pooled[c].values.astype(float) for b, c in colmap.items()}
+            per_filter = True
     else:
-        groups = {'all': pooled['drw_max_z'].values}
+        per_filter = (not args.no_per_filter) and ('filter' in pooled.columns)
+        if per_filter:
+            groups = {
+                int(flt): grp['drw_max_z'].values
+                for flt, grp in pooled.groupby('filter')
+            }
+        else:
+            groups = {'all': pooled['drw_max_z'].values}
+
+    print(f"Feature layout: {layout} ({len(colmap)} max_z column(s))")
 
     calibration = {
         'p_target': p_target,
         'per_filter': per_filter,
+        'layout': layout,
         'groups': {},
     }
 
@@ -273,6 +326,24 @@ def main():
         return
 
     for path, df in zip(paths, frames):
+        if layout == 'wide':
+            # Per-band columns mirror the feature naming: anomaly_score_g etc.
+            for band, col in colmap.items():
+                calib = calibration['groups'].get(str(band))
+                if calib is None or col not in df.columns:
+                    continue
+                z = df[col].values.astype(float)
+                finite = np.isfinite(z)
+                band_flag = np.full(z.shape, np.nan)
+                band_flag[finite] = (z[finite] > calib['detection_threshold']).astype(
+                    float
+                )
+                df[f'anomaly_score_{band}'] = anomaly_score(z, calib)
+                df[f'anomaly_flag_{band}'] = band_flag
+            df.to_parquet(path, index=False)
+            print(f"Updated {path}")
+            continue
+
         score = np.full(len(df), np.nan)
         flag = np.full(len(df), np.nan)
 

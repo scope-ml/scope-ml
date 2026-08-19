@@ -10,7 +10,7 @@ except Exception:
     get_ids_loop = None
     get_field_ids = None
 
-from scope.fritz import get_lightcurves_via_ids
+from scope.surveys.fritz import get_lightcurves_via_ids
 from scope.utils import (
     TychoBVfromGaia,
     exclude_radius,
