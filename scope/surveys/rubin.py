@@ -707,6 +707,51 @@ class RubinLocalClient:
         lightcurves = self.get_lightcurves(objectids, bands=bands)
         return objects, lightcurves
 
+    def get_eligible_objects(self, min_n_lc_points=50, bands=None):
+        """
+        Find objects with at least ``min_n_lc_points`` valid detections.
+
+        Applies the same quality cuts as ``get_lightcurves`` (pixelFlags
+        == 0, psfFlux > 0, psfFluxErr > 0) before counting, so the
+        returned objects match what feature generation will actually see.
+        Used by ``prepare-rubin-chunks`` to split a full catalog into
+        chunks worth processing.
+
+        Parameters
+        ----------
+        min_n_lc_points : int, optional
+            Minimum number of valid detections required (default 50).
+        bands : list of str, optional
+            Restrict the count to these bands. If None, all bands count.
+
+        Returns
+        -------
+        dict
+            {objectId: {'coord_ra': ra_deg, 'coord_dec': dec_deg}, ...}
+        """
+        self._load_objects()
+        self._load_forced_sources()
+
+        valid = self._fs_df[
+            (self._fs_df["pixelFlags"] == 0)
+            & (self._fs_df["psfFlux"] > 0)
+            & (self._fs_df["psfFluxErr"] > 0)
+        ]
+        if bands is not None and len(bands) > 0:
+            valid = valid[valid["band"].isin(bands)]
+
+        counts = valid.groupby("objectId").size()
+        eligible_ids = set(counts[counts >= min_n_lc_points].index)
+
+        return {
+            int(self._obj_ids[i]): {
+                "coord_ra": float(self._obj_ra_deg[i]),
+                "coord_dec": float(self._obj_dec_deg[i]),
+            }
+            for i in range(len(self._obj_ids))
+            if int(self._obj_ids[i]) in eligible_ids
+        }
+
 
 class RubinLocalDiaClient:
     """
@@ -1006,6 +1051,48 @@ class RubinLocalDiaClient:
         objectids = list(objects.keys())
         lightcurves = self.get_lightcurves(objectids, bands=bands)
         return objects, lightcurves
+
+    def get_eligible_objects(self, min_n_lc_points=50, bands=None):
+        """
+        Find DIA objects with at least ``min_n_lc_points`` valid detections.
+
+        See ``RubinLocalClient.get_eligible_objects`` for the filtering
+        logic; this is the DIA-table (no isolation cut) equivalent.
+
+        Parameters
+        ----------
+        min_n_lc_points : int, optional
+            Minimum number of valid detections required (default 50).
+        bands : list of str, optional
+            Restrict the count to these bands. If None, all bands count.
+
+        Returns
+        -------
+        dict
+            {objectId: {'coord_ra': ra_deg, 'coord_dec': dec_deg}, ...}
+        """
+        self._load_objects()
+        self._load_forced_sources()
+
+        valid = self._fs_df[
+            (self._fs_df["pixelFlags"] == 0)
+            & (self._fs_df["psfFlux"] > 0)
+            & (self._fs_df["psfFluxErr"] > 0)
+        ]
+        if bands is not None and len(bands) > 0:
+            valid = valid[valid["band"].isin(bands)]
+
+        counts = valid.groupby("objectId").size()
+        eligible_ids = set(counts[counts >= min_n_lc_points].index)
+
+        return {
+            int(self._obj_ids[i]): {
+                "coord_ra": float(self._obj_ra_deg[i]),
+                "coord_dec": float(self._obj_dec_deg[i]),
+            }
+            for i in range(len(self._obj_ids))
+            if int(self._obj_ids[i]) in eligible_ids
+        }
 
 
 class RubinLocalDP2Client:
@@ -1383,6 +1470,52 @@ class RubinLocalDP2Client:
         objectids = list(objects.keys())
         lightcurves = self.get_lightcurves(objectids, bands=bands)
         return objects, lightcurves
+
+    def get_eligible_objects(self, min_n_lc_points=50, bands=None):
+        """
+        Find objects with at least ``min_n_lc_points`` valid detections.
+
+        Applies the same quality cuts as ``get_lightcurves`` (pixelFlags
+        == 0, selected flux column > 0, its error > 0) before counting.
+        Since the DP2 export is already a variability-candidate selection,
+        this is normally a light additional filter; used by
+        ``prepare-rubin-chunks`` to split the export into chunks worth
+        processing.
+
+        Parameters
+        ----------
+        min_n_lc_points : int, optional
+            Minimum number of valid detections required (default 50).
+        bands : list of str, optional
+            Restrict the count to these bands. If None, all bands count.
+
+        Returns
+        -------
+        dict
+            {objectId: {'coord_ra': ra_deg, 'coord_dec': dec_deg}, ...}
+        """
+        self._load_objects()
+        self._load_forced_sources()
+
+        valid = self._fs_df[
+            (self._fs_df["pixelFlags"] == 0)
+            & (self._fs_df[self.flux_column] > 0)
+            & (self._fs_df[self.flux_err_column] > 0)
+        ]
+        if bands is not None and len(bands) > 0:
+            valid = valid[valid["band"].isin(bands)]
+
+        counts = valid.groupby("objectId").size()
+        eligible_ids = set(counts[counts >= min_n_lc_points].index)
+
+        return {
+            int(self._obj_ids[i]): {
+                "coord_ra": float(self._obj_ra_deg[i]),
+                "coord_dec": float(self._obj_dec_deg[i]),
+            }
+            for i in range(len(self._obj_ids))
+            if int(self._obj_ids[i]) in eligible_ids
+        }
 
 
 def make_rubin_client(config=None, use_dia=False, release=None):
