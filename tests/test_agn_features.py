@@ -233,6 +233,43 @@ class TestDRW:
 # ---------------------------------------------------------------------------
 
 
+    def test_unconstrained_fit_is_not_flagged_success(self):
+        """A fit that runs to a parameter bound must not report success.
+
+        scipy reports convergence even when the optimum sits against a
+        bound, so on a baseline too short to show the DRW turnover every
+        fit came back drw_fit_success = 1 with tau pinned at a rail. The
+        flag has to distinguish converged from constrained, or anything
+        filtering on it downstream gets meaningless tau and sigma.
+        """
+        # A pure white-noise curve: there is no damping timescale to find,
+        # so the fit has nothing to constrain tau with.
+        rng = np.random.default_rng(1)
+        n = 120
+        times = np.sort(rng.uniform(0.0, 200.0, n))
+        magerrs = np.full(n, 0.02)
+        mags = 20.0 + rng.normal(0.0, 0.02, n)
+
+        stats = drw.calc_drw_stats((times, mags, magerrs))
+
+        baseline = times[-1] - times[0]
+        constrained = drw._fit_is_constrained(
+            stats['drw_tau'], stats['drw_sigma'], times
+        )
+        assert stats['drw_fit_success'] == int(constrained)
+        if not constrained:
+            # the parameters are still reported, as limits
+            assert np.isfinite(stats['drw_tau'])
+            assert np.isfinite(stats['drw_max_z'])
+
+        # An explicitly out-of-range tau is never constrained
+        assert not drw._fit_is_constrained(10.0 * baseline, 0.1, times)
+        assert not drw._fit_is_constrained(1e-6, 0.1, times)
+        assert not drw._fit_is_constrained(0.5 * baseline, 1e-8, times)
+        # ... while a sane one is
+        assert drw._fit_is_constrained(0.1 * baseline, 0.1, times)
+
+
 class TestEVT:
     """Tests for the EVT (peaks-over-threshold / GPD) calibration."""
 

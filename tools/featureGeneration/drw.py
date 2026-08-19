@@ -37,7 +37,61 @@ LOG_A_BOUNDS = (np.log(1e-8), np.log(1e2))  # process variance (mag^2)
 LOG_C_BOUNDS = (np.log(1e-5), np.log(1e2))  # inverse timescale (1/day)
 LOG_JITTER_BOUNDS = (np.log(1e-6), np.log(1e1))  # extra white noise (mag)
 
+#: tau longer than this multiple of the baseline is treated as unresolved.
+#: 1.0 is the weakest defensible cut - a timescale longer than the observing
+#: window cannot be measured at all. The AGN literature is stricter (unbiased
+#: tau recovery is usually quoted as needing baseline > ~10 tau), so 0.1 is the
+#: conservative choice if you care about tau as a physical quantity rather than
+#: as a nuisance parameter.
+DEFAULT_TAU_MAX_BASELINE_FRAC = 1.0
+
 DRW_FEATURE_KEYS = ['drw_tau', 'drw_sigma', 'drw_max_z', 'drw_fit_success']
+
+
+def _fit_is_constrained(tau, sigma, t, tau_max_baseline_frac=None):
+    """Did the data actually determine tau and sigma, or did the fit run to a bound?
+
+    ``scipy``'s convergence flag says only that the minimiser terminated; it
+    reports success just as happily when the optimum sits against a parameter
+    bound. On a 257-day Rubin DP2 baseline that happens for most objects: tau
+    piles up at both rails (0.01 d and 1e5 d) and sigma collapses onto its
+    floor while the jitter term absorbs the variance. Those fits converged,
+    but their parameters carry no information, and anything downstream that
+    filters on ``drw_fit_success`` would otherwise treat them as trustworthy.
+
+    Unconstrained when any of:
+
+    * tau exceeds the baseline (the window cannot show the turnover),
+    * tau falls below the median sampling interval (nothing resolves it),
+    * sigma sits on its lower bound (the DRW term has no amplitude left).
+
+    Note this is a statement about *identifiability*, not fit quality - a
+    rail value is still meaningful as a limit, so tau and sigma are returned
+    unchanged and only the flag is lowered.
+    """
+    if not (np.isfinite(tau) and np.isfinite(sigma)) or tau <= 0:
+        return False
+
+    frac = (
+        DEFAULT_TAU_MAX_BASELINE_FRAC
+        if tau_max_baseline_frac is None
+        else tau_max_baseline_frac
+    )
+
+    baseline = float(t[-1] - t[0])
+    if baseline <= 0 or tau > frac * baseline:
+        return False
+
+    if len(t) > 1:
+        cadence = float(np.median(np.diff(t)))
+        if cadence > 0 and tau < cadence:
+            return False
+
+    sigma_floor = np.sqrt(np.exp(LOG_A_BOUNDS[0]))
+    if sigma <= sigma_floor * 1.01:
+        return False
+
+    return True
 
 
 def _nan_stats():
@@ -137,6 +191,7 @@ def calc_drw_stats(
     min_epochs=DEFAULT_MIN_EPOCHS,
     max_iter=DEFAULT_MAX_ITER,
     z_thr=DEFAULT_Z_THR,
+    tau_max_baseline_frac=None,
 ):
     """Compute DRW features for a single (times, mags, magerrs) tuple.
 
@@ -148,6 +203,11 @@ def calc_drw_stats(
     Returns a dict with keys drw_tau, drw_sigma, drw_max_z, drw_fit_success.
     Values are NaN (and drw_fit_success = 0) when the light curve is too
     short or the fit fails.
+
+    drw_fit_success means the optimiser converged AND the data constrained
+    the parameters - see _fit_is_constrained. tau and sigma are reported
+    even when the flag is 0, where a rail value should be read as a limit
+    rather than an estimate.
     """
     t = np.asarray(tme[0], dtype=float)
     y = np.asarray(tme[1], dtype=float)
@@ -183,11 +243,14 @@ def calc_drw_stats(
             break
 
         z = ou_resid(t, y, yerr, tau, sigma, mu, jitter)
+        constrained = _fit_is_constrained(
+            tau, sigma, t[ix], tau_max_baseline_frac=tau_max_baseline_frac
+        )
         result = {
             'drw_tau': float(tau),
             'drw_sigma': float(sigma),
             'drw_max_z': float(np.max(np.abs(z))),
-            'drw_fit_success': int(success),
+            'drw_fit_success': int(bool(success) and constrained),
         }
 
         new_mask = np.abs(z) > z_thr
