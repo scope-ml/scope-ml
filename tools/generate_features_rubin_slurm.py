@@ -180,14 +180,16 @@ def generate_slurm_script(
     lines.append(f"#SBATCH --time={time}")
     lines.append(f"#SBATCH --array={array_range}")
     lines.append("")
-    lines.append("# Edit the lines above (partition/account/mem/module loads) for your cluster.")
+    lines.append(
+        "# Edit the lines above (partition/account/mem/module loads) for your cluster."
+    )
     lines.append("module purge")
     for module in modules or []:
         lines.append(f"module load {module}")
     if venv is not None:
         lines.append(f"source {venv}/bin/activate")
     lines.append("")
-    lines.append(f'TASK_ID=$(printf "%03d" ${{SLURM_ARRAY_TASK_ID}})')
+    lines.append('TASK_ID=$(printf "%03d" ${SLURM_ARRAY_TASK_ID})')
     lines.append(f'CHUNK_FILE="{os.path.abspath(chunk_dir)}/chunk_${{TASK_ID}}.csv"')
     lines.append("")
     lines.append(
