@@ -1581,13 +1581,34 @@ feature_generation:
   path_to_features:
   # PDRS flare/high-activity segmentation parameters (--doFlareDetection), tuned for ZTF DR23
   pdrs:
-    bin_size_days: 3.0
+    # Slow mode: coherent brightenings lasting days to weeks. Tuned on Rubin
+    # DP2 r by injection-recovery over 576 grid points on two independent host
+    # draws; the previous values were tuned on ZTF DR23. The same settings came
+    # out best both as a detector and as a mask supplier for the DRW fit
+    # (the two objectives correlate at 0.913), and they are indistinguishable
+    # from the old ones on the labelled DP2 objects.
+    bin_size_days: 1.0
     peak_threshold: 2.0
-    smooth_window: 7
+    smooth_window: 3
     min_cluster_size: 3
     saddle_ratio: 0.2
-    region_threshold: 0.5
+    region_threshold: 0.3
     max_gap_days: 60.0
+  # Fast mode (calc_fast_pdrs_stats): coherent brightenings lasting minutes,
+  # e.g. stellar flares, which the slow mode averages away inside one bin. The
+  # detection threshold is measured against each bin's own uncertainty rather
+  # than the scatter of the whole curve, because at these bin sizes a bin holds
+  # a single exposure. Emits n_fast_flares / fast_flare_significance /
+  # fast_flare_duty_cycle. Note n_fast_flares is positive for most real curves;
+  # the significance, calibrated against the population, is the useful output.
+  pdrs_fast:
+    bin_size_days: 0.003472    # 5 minutes
+    peak_threshold: 12.0       # units of the per-bin error, not of the scatter
+    smooth_window: 3
+    min_cluster_size: 3
+    saddle_ratio: 0.2
+    region_threshold: 1.0
+    max_gap_days: 0.0625       # 90 minutes
   # Damped-random-walk fit parameters (--doDRW). max_iter: 1 is a single plain fit;
   # max_iter > 1 iteratively masks |z| > z_thr outliers between refits
   drw:

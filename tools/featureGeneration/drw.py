@@ -192,6 +192,7 @@ def calc_drw_stats(
     max_iter=DEFAULT_MAX_ITER,
     z_thr=DEFAULT_Z_THR,
     tau_max_baseline_frac=None,
+    mask_regions=None,
 ):
     """Compute DRW features for a single (times, mags, magerrs) tuple.
 
@@ -199,6 +200,14 @@ def calc_drw_stats(
     max_iter > 1, points with |z| > z_thr are masked and the model refit,
     keeping flares out of their own baseline; residuals are always evaluated
     on all points.
+
+    mask_regions is a sequence of (start_mjd, end_mjd) intervals to keep out of
+    the fit - pdrs.flare_regions produces them. A flare is contiguous, so
+    excluding the interval removes the rise and decay along with the peak,
+    where the |z| > z_thr clipping above removes only the most deviant points
+    and leaves the wings to inflate sigma. Residuals are still evaluated on all
+    points, so a masked event remains visible in drw_max_z. The intervals are
+    applied first and held for every iteration.
 
     Returns a dict with keys drw_tau, drw_sigma, drw_max_z, drw_fit_success.
     Values are NaN (and drw_fit_success = 0) when the light curve is too
@@ -230,6 +239,15 @@ def calc_drw_stats(
         return _nan_stats()
 
     mask = np.zeros(len(t), dtype=bool)
+    if mask_regions is not None:
+        for start, end in mask_regions:
+            mask |= (t >= start) & (t <= end)
+        # Masking everything leaves nothing to fit; a curve that is entirely
+        # flare is better described by an uncontaminated failure than by a fit
+        # to its own event.
+        if (~mask).sum() < min_epochs:
+            mask = np.zeros(len(t), dtype=bool)
+    fixed_mask = mask.copy()
     result = None
 
     for _ in range(max(1, int(max_iter))):
@@ -255,6 +273,7 @@ def calc_drw_stats(
 
         new_mask = np.abs(z) > z_thr
         new_mask[0] = new_mask[-1] = False
+        new_mask |= fixed_mask
         if np.array_equal(new_mask, mask):
             break
         mask = new_mask
@@ -265,26 +284,57 @@ def calc_drw_stats(
     return result
 
 
+def _calc_drw_stats_pair(
+    pair,
+    min_epochs=DEFAULT_MIN_EPOCHS,
+    max_iter=DEFAULT_MAX_ITER,
+    z_thr=DEFAULT_Z_THR,
+):
+    """calc_drw_stats over a (tme, mask_regions) pair, for pool.map."""
+    tme, mask_regions = pair
+    return calc_drw_stats(
+        tme,
+        min_epochs=min_epochs,
+        max_iter=max_iter,
+        z_thr=z_thr,
+        mask_regions=mask_regions,
+    )
+
+
 def calc_drw_stats_batch(
     tme_list,
     Ncore=1,
     min_epochs=DEFAULT_MIN_EPOCHS,
     max_iter=DEFAULT_MAX_ITER,
     z_thr=DEFAULT_Z_THR,
+    mask_regions_list=None,
 ):
     """Compute DRW features for a list of (times, mags, magerrs) tuples,
     optionally in parallel across Ncore processes.
+
+    mask_regions_list, when given, holds one sequence of (start, end) intervals
+    per light curve - pdrs.flare_regions produces them - to keep out of that
+    curve's fit. Pass None in a slot to fit that curve unmasked.
     """
     from functools import partial
 
+    if mask_regions_list is None:
+        mask_regions_list = [None] * len(tme_list)
+    elif len(mask_regions_list) != len(tme_list):
+        raise ValueError(
+            'mask_regions_list has %d entries for %d light curves'
+            % (len(mask_regions_list), len(tme_list))
+        )
+
     func = partial(
-        calc_drw_stats, min_epochs=min_epochs, max_iter=max_iter, z_thr=z_thr
+        _calc_drw_stats_pair, min_epochs=min_epochs, max_iter=max_iter, z_thr=z_thr
     )
+    pairs = list(zip(tme_list, mask_regions_list))
 
     if Ncore is None or Ncore <= 1 or len(tme_list) < 2:
-        return [func(tme) for tme in tme_list]
+        return [func(pair) for pair in pairs]
 
     import multiprocessing as mp
 
     with mp.Pool(min(Ncore, len(tme_list))) as pool:
-        return pool.map(func, tme_list)
+        return pool.map(func, pairs)

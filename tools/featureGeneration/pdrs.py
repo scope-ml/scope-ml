@@ -30,6 +30,29 @@ DEFAULT_MAX_GAP_DAYS = 60.0
 
 PDRS_FEATURE_KEYS = ['n_flares', 'flare_significance', 'flare_duty_cycle']
 
+#: Defaults for the fast (SNR) mode. Minute-scale bins, so the numbers look
+#: nothing like the slow ones: bin 5 minutes, gap 90 minutes. Tuned on DP2 r
+#: by injection-recovery over 1350 grid points on two independent host draws.
+FAST_BIN_SIZE_DAYS = 5.0 / 1440.0
+FAST_PEAK_THRESHOLD = 12.0
+FAST_MAX_GAP_DAYS = 90.0 / 1440.0
+FAST_SMOOTH_WINDOW = 3
+FAST_REGION_THRESHOLD = 1.0
+
+#: The fast mode emits its own columns rather than overwriting the slow ones -
+#: they detect different things and are computed with different parameters.
+#: n_fast_flares is positive for most real curves at minute bins, so
+#: fast_flare_significance is the informative member of this set; see
+#: calc_pdrs_stats.
+FAST_PDRS_FEATURE_KEYS = [
+    'n_fast_flares',
+    'fast_flare_significance',
+    'fast_flare_duty_cycle',
+]
+
+#: slow key -> fast key, so the renaming lives in exactly one place.
+_FAST_KEY_MAP = dict(zip(PDRS_FEATURE_KEYS, FAST_PDRS_FEATURE_KEYS))
+
 
 def _nan_stats():
     return {key: np.nan for key in PDRS_FEATURE_KEYS}
@@ -101,8 +124,17 @@ def detect_flares(
     saddle_ratio=DEFAULT_SADDLE_RATIO,
     region_threshold=DEFAULT_REGION_THRESHOLD,
     max_gap=DEFAULT_MAX_GAP_DAYS,
+    err=None,
 ):
     """Peak-first flare detection on a (binned) flux light curve.
+
+    The peak threshold, the region gate and the significance are all measured
+    against a scale. With err=None that scale is the global scatter of the
+    curve, which is the right denominator when a bin averages many
+    measurements. Passing per-bin errors measures each bin against its own
+    uncertainty instead - the right denominator when a bin holds a single
+    exposure, i.e. minute-scale bins, where intrinsic variability has not had
+    time to act and the measurement noise dominates.
 
     Returns a list of regions, each a dict with keys
     'start', 'end', 'peak_flux', 'significance'.
@@ -114,7 +146,14 @@ def detect_flares(
     median_f = np.median(flux)
     std_f = np.std(flux)
 
-    flux_threshold = median_f + peak_threshold * std_f
+    if err is None:
+        scale = np.full(n_points, std_f, dtype=float)
+    else:
+        scale = np.asarray(err, dtype=float)
+        # A non-positive or non-finite error must never lower the bar.
+        scale = np.where(np.isfinite(scale) & (scale > 0), scale, np.inf)
+
+    flux_threshold = median_f + peak_threshold * scale
 
     # Calculate smoothed gradient for expansion boundaries
     grad = get_uneven_gradient(mjd, flux, window=smooth_window)
@@ -129,7 +168,7 @@ def detect_flares(
     if n_points >= 2 and flux[-1] > flux[-2]:
         peaks.append(n_points - 1)
 
-    peaks = [p for p in peaks if flux[p] > flux_threshold]
+    peaks = [p for p in peaks if flux[p] > flux_threshold[p]]
     if not peaks:
         return []
 
@@ -233,21 +272,88 @@ def detect_flares(
 
     # Final gate: the region median must clear the global median by
     # region_threshold sigma
-    support_threshold = median_f + region_threshold * std_f
+    support_threshold = median_f + region_threshold * scale
     flares = []
     for s, e in merged_indices:
         region_flux = flux[s : e + 1]
-        if np.median(region_flux) >= support_threshold:
+        if np.median(region_flux) >= np.median(support_threshold[s : e + 1]):
+            k = s + int(np.argmax(region_flux))
             flares.append(
                 {
                     'start': mjd[s],
                     'end': mjd[e],
                     'peak_flux': np.max(region_flux),
-                    'significance': (np.max(region_flux) - median_f) / std_f,
+                    'significance': (flux[k] - median_f) / scale[k],
                 }
             )
 
     return flares
+
+
+def _prepare(tme, bin_size_days, min_cluster_size):
+    """Clean, sort and bin a (times, mags, magerrs) tuple for detect_flares.
+
+    Returns (t, b_t, b_f, b_fe), or None when the curve is too short. Shared by
+    calc_pdrs_stats and flare_regions so both see exactly the same binning.
+    """
+    t = np.asarray(tme[0], dtype=float)
+    mag = np.asarray(tme[1], dtype=float)
+    magerr = np.asarray(tme[2], dtype=float)
+
+    keep = np.isfinite(t) & np.isfinite(mag) & np.isfinite(magerr) & (magerr > 0)
+    t, mag, magerr = t[keep], mag[keep], magerr[keep]
+
+    if len(t) < max(4, min_cluster_size):
+        return None
+
+    order = np.argsort(t)
+    t, mag, magerr = t[order], mag[order], magerr[order]
+
+    flux = 10 ** (-0.4 * (mag - np.median(mag)))
+    fluxerr = 0.4 * np.log(10) * flux * magerr
+
+    b_t, b_f, b_fe = bin_light_curve(t, flux, fluxerr, bin_size=bin_size_days)
+
+    if len(b_t) < max(4, min_cluster_size):
+        return None
+
+    return t, b_t, b_f, b_fe
+
+
+def flare_regions(
+    tme,
+    bin_size_days=DEFAULT_BIN_SIZE_DAYS,
+    peak_threshold=DEFAULT_PEAK_THRESHOLD,
+    smooth_window=DEFAULT_SMOOTH_WINDOW,
+    min_cluster_size=DEFAULT_MIN_CLUSTER_SIZE,
+    saddle_ratio=DEFAULT_SADDLE_RATIO,
+    region_threshold=DEFAULT_REGION_THRESHOLD,
+    max_gap_days=DEFAULT_MAX_GAP_DAYS,
+    use_snr=False,
+):
+    """Flare intervals as a list of (start_mjd, end_mjd), earliest first.
+
+    calc_pdrs_stats summarises the flares it finds and discards their extent.
+    Callers that need the extent - keeping a flare out of a DRW fit, say - use
+    this instead. The detection is identical; only the return value differs.
+    """
+    prep = _prepare(tme, bin_size_days, min_cluster_size)
+    if prep is None:
+        return []
+    _, b_t, b_f, b_fe = prep
+
+    flares = detect_flares(
+        b_t,
+        b_f,
+        peak_threshold=peak_threshold,
+        smooth_window=smooth_window,
+        min_cluster_size=min_cluster_size,
+        saddle_ratio=saddle_ratio,
+        region_threshold=region_threshold,
+        max_gap=max_gap_days,
+        err=b_fe if use_snr else None,
+    )
+    return [(float(f['start']), float(f['end'])) for f in flares]
 
 
 def calc_pdrs_stats(
@@ -259,35 +365,27 @@ def calc_pdrs_stats(
     saddle_ratio=DEFAULT_SADDLE_RATIO,
     region_threshold=DEFAULT_REGION_THRESHOLD,
     max_gap_days=DEFAULT_MAX_GAP_DAYS,
+    use_snr=False,
 ):
     """Compute PDRS flare features for a single (times, mags, magerrs) tuple.
 
     Magnitudes are converted to flux relative to the median magnitude, so a
     brightening (decreasing magnitude) appears as a flux increase.
 
+    With use_snr the detection is measured against each bin's own uncertainty
+    rather than against the scatter of the whole curve. That is the mode for
+    minute-scale bins, where a bin holds a single exposure; see detect_flares.
+    At those bin sizes n_flares is positive for most real light curves, so
+    flare_significance - calibrated against the population, the way EVT treats
+    drw_max_z - is the informative output rather than the count.
+
     Returns a dict with keys n_flares, flare_significance, flare_duty_cycle;
     all NaN if the light curve has too few usable points.
     """
-    t = np.asarray(tme[0], dtype=float)
-    mag = np.asarray(tme[1], dtype=float)
-    magerr = np.asarray(tme[2], dtype=float)
-
-    keep = np.isfinite(t) & np.isfinite(mag) & np.isfinite(magerr) & (magerr > 0)
-    t, mag, magerr = t[keep], mag[keep], magerr[keep]
-
-    if len(t) < max(4, min_cluster_size):
+    prep = _prepare(tme, bin_size_days, min_cluster_size)
+    if prep is None:
         return _nan_stats()
-
-    order = np.argsort(t)
-    t, mag, magerr = t[order], mag[order], magerr[order]
-
-    flux = 10 ** (-0.4 * (mag - np.median(mag)))
-    fluxerr = 0.4 * np.log(10) * flux * magerr
-
-    b_t, b_f, _ = bin_light_curve(t, flux, fluxerr, bin_size=bin_size_days)
-
-    if len(b_t) < max(4, min_cluster_size):
-        return _nan_stats()
+    t, b_t, b_f, b_fe = prep
 
     flares = detect_flares(
         b_t,
@@ -298,6 +396,7 @@ def calc_pdrs_stats(
         saddle_ratio=saddle_ratio,
         region_threshold=region_threshold,
         max_gap=max_gap_days,
+        err=b_fe if use_snr else None,
     )
 
     baseline = t[-1] - t[0]
@@ -311,3 +410,35 @@ def calc_pdrs_stats(
         'flare_significance': float(np.max([f['significance'] for f in flares])),
         'flare_duty_cycle': min(total_flare_time / baseline, 1.0),
     }
+
+
+def calc_fast_pdrs_stats(
+    tme,
+    bin_size_days=FAST_BIN_SIZE_DAYS,
+    peak_threshold=FAST_PEAK_THRESHOLD,
+    smooth_window=FAST_SMOOTH_WINDOW,
+    min_cluster_size=DEFAULT_MIN_CLUSTER_SIZE,
+    saddle_ratio=DEFAULT_SADDLE_RATIO,
+    region_threshold=FAST_REGION_THRESHOLD,
+    max_gap_days=FAST_MAX_GAP_DAYS,
+):
+    """PDRS in fast (SNR) mode, returned under the fast feature names.
+
+    Same detector as calc_pdrs_stats(use_snr=True); this only fixes the
+    minute-scale defaults and renames the outputs, so a light curve can carry
+    both the slow and the fast features without one overwriting the other.
+
+    Returns a dict keyed by FAST_PDRS_FEATURE_KEYS.
+    """
+    stats = calc_pdrs_stats(
+        tme,
+        bin_size_days=bin_size_days,
+        peak_threshold=peak_threshold,
+        smooth_window=smooth_window,
+        min_cluster_size=min_cluster_size,
+        saddle_ratio=saddle_ratio,
+        region_threshold=region_threshold,
+        max_gap_days=max_gap_days,
+        use_snr=True,
+    )
+    return {_FAST_KEY_MAP[k]: v for k, v in stats.items()}

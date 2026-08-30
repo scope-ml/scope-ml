@@ -52,6 +52,7 @@ period_algorithms = config['feature_generation']['period_algorithms']
 path_to_features = config['feature_generation']['path_to_features']
 period_search_config = config['feature_generation'].get('period_search', {})
 pdrs_params = config['feature_generation'].get('pdrs', {})
+pdrs_fast_params = config['feature_generation'].get('pdrs_fast', {})
 drw_params = config['feature_generation'].get('drw', {})
 
 if path_to_features is not None:
@@ -113,7 +114,9 @@ def generate_features_rubin(
     dirname='/fred/oz480/mcoughli/generated_features_rubin',
     filename='gen_features_rubin',
     doFlareDetection=False,
+    doFastFlareDetection=False,
     doDRW=False,
+    doMaskFlares=False,
     doNotSave=False,
     stop_early=False,
     limit=10000,
@@ -168,6 +171,12 @@ def generate_features_rubin(
     doFlareDetection : bool
         Compute PDRS flare/high-activity segmentation features, per band
         (n_flares_g, flare_significance_g, flare_duty_cycle_g, ...).
+    doFastFlareDetection : bool
+        Compute PDRS in fast (SNR) mode for minute-scale flares, emitting
+        n_fast_flares_<band>, fast_flare_significance_<band> and
+        fast_flare_duty_cycle_<band>. Independent of doFlareDetection.
+    doMaskFlares : bool
+        With doDRW, keep PDRS-detected flare intervals out of the DRW fit.
     doDRW : bool
         Fit damped-random-walk models and compute DRW anomaly features, per
         band (drw_tau_g, drw_sigma_g, drw_max_z_g, drw_fit_success_g, ...).
@@ -463,6 +472,24 @@ def generate_features_rubin(
                 for key, val in pdrs_stats.items():
                     feature_dict[_id][f'{key}_{band_name}'] = val
 
+    # The fast mode is a second parameter set, not a replacement: minute-scale
+    # bins measured against each bin's own uncertainty. It emits its own columns
+    # (n_fast_flares_g, fast_flare_significance_g, ...), so --doFlareDetection
+    # and --doFastFlareDetection can be used separately or together.
+    if doFastFlareDetection:
+        print(
+            f'Computing fast (SNR) PDRS flare features for {len(id_list_bs)} '
+            'sources...'
+        )
+        for band_int, band_name in BAND_NAMES.items():
+            for _id in id_list_bs:
+                bb = tme_dict[_id].get('band')
+                tme = tme_dict[_id]['tme']
+                tme_band = tme[:, bb == band_int] if bb is not None else tme[:, :0]
+                fast_stats = pdrs.calc_fast_pdrs_stats(tme_band, **pdrs_fast_params)
+                for key, val in fast_stats.items():
+                    feature_dict[_id][f'{key}_{band_name}'] = val
+
     if doDRW:
         print(f'Computing DRW features for {len(id_list_bs)} sources...')
         for band_int, band_name in BAND_NAMES.items():
@@ -473,9 +500,20 @@ def generate_features_rubin(
                 band_lcs.append(
                     tme[:, bb == band_int] if bb is not None else tme[:, :0]
                 )
+            # A flare in the curve inflates the fitted sigma. Masking its
+            # interval keeps the whole event - rise, peak and decay - out of the
+            # fit, while residuals are still evaluated on every point, so the
+            # event remains visible in drw_max_z. Slow-mode parameters are used
+            # deliberately: they were tuned for this as well as for detection.
+            mask_regions_list = None
+            if doMaskFlares:
+                mask_regions_list = [
+                    pdrs.flare_regions(lc, **pdrs_params) for lc in band_lcs
+                ]
             drw_stats_list = drw.calc_drw_stats_batch(
                 band_lcs,
                 Ncore=Ncore,
+                mask_regions_list=mask_regions_list,
                 **drw_params,
             )
             for _id, drw_stats in zip(id_list_bs, drw_stats_list):
@@ -1351,10 +1389,31 @@ def get_parser(**kwargs):
         help="Compute per-band PDRS flare/high-activity segmentation features",
     )
     parser.add_argument(
+        "--doFastFlareDetection",
+        action='store_true',
+        default=False,
+        help=(
+            "Compute per-band PDRS features in fast (SNR) mode for minute-scale "
+            "flares, as n_fast_flares/fast_flare_significance/"
+            "fast_flare_duty_cycle. Independent of --doFlareDetection; use "
+            "either or both"
+        ),
+    )
+    parser.add_argument(
         "--doDRW",
         action='store_true',
         default=False,
         help="Fit per-band damped-random-walk models and compute DRW anomaly features",
+    )
+    parser.add_argument(
+        "--doMaskFlares",
+        action='store_true',
+        default=False,
+        help=(
+            "With --doDRW, keep PDRS-detected flare intervals out of the DRW "
+            "fit so drw_tau/drw_sigma are not biased by the event. Residuals "
+            "are still evaluated on all points"
+        ),
     )
     parser.add_argument(
         "--doNotSave",
@@ -1443,7 +1502,9 @@ def main():
         dirname=args.dirname,
         filename=args.filename,
         doFlareDetection=args.doFlareDetection,
+        doFastFlareDetection=args.doFastFlareDetection,
         doDRW=args.doDRW,
+        doMaskFlares=args.doMaskFlares,
         doNotSave=args.doNotSave,
         stop_early=args.stop_early,
         limit=args.query_size_limit,
