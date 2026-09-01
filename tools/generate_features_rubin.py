@@ -95,6 +95,90 @@ except Exception:
     pass
 
 
+#: How each AGN feature collapses from per-band columns to the bare column the
+#: feature registry addresses.  The registry uses bare names and the only name
+#: transform in the training path is the period suffix, so every pre-existing
+#: Rubin feature emits both forms - `wstd` and `wstd_u..y`, `n` and `n_u..y`.
+#: The AGN features emitted per-band columns alone, which made them unreachable:
+#: flipping any AGN entry to include: true sent scope/utils.py looking for a
+#: column that does not exist.
+#:
+#: The combination rule is a science choice, not a mechanical one:
+#:   counts and detection statistics -> max.  A flare seen in three bands is one
+#:      flare, and the band that detects it most strongly is the detection.
+#:   drw_max_z -> max.  It is an anomaly statistic; EVT calibrates per band and
+#:      an object is flagged by the union of the bands.
+#:   drw_tau, drw_sigma -> median over the bands whose fit is CONSTRAINED.  These
+#:      are physical parameters, so the median is robust to one bad band, and
+#:      unconstrained fits sit against a parameter bound and carry no
+#:      information.  NaN when no band constrains the fit, which is the honest
+#:      answer on a short baseline.
+#:   drw_fit_success -> 1 if any band is constrained.
+#: Fitting the merged multi-band curve instead was considered and rejected in the
+#: original port: chromatic offsets and per-band amplitude differences would be
+#: read as intrinsic variability and bias drw_sigma high.
+AGN_BARE_MAX_KEYS = ['drw_max_z']
+AGN_BARE_MEDIAN_CONSTRAINED_KEYS = ['drw_tau', 'drw_sigma']
+
+
+def add_bare_agn_columns(
+    feature_dict,
+    id_list,
+    band_names,
+    do_flare=False,
+    do_fast_flare=False,
+    do_drw=False,
+):
+    """Add bare AGN columns next to the per-band ones, in place.
+
+    Parameters
+    ----------
+    feature_dict : dict
+        ``{source_id: {feature_name: value}}``, already holding the per-band
+        columns such as ``drw_tau_g`` and ``n_flares_r``.
+    id_list : list
+        Sources to process.
+    band_names : dict or iterable
+        Band names, e.g. ``{0: 'u', 1: 'g', ...}`` or ``['u', 'g', ...]``.
+    do_flare, do_fast_flare, do_drw : bool
+        Which feature groups were computed.
+    """
+    bands = (
+        list(band_names.values()) if isinstance(band_names, dict) else list(band_names)
+    )
+
+    max_keys = []
+    if do_flare:
+        max_keys += list(pdrs.PDRS_FEATURE_KEYS)
+    if do_fast_flare:
+        max_keys += list(pdrs.FAST_PDRS_FEATURE_KEYS)
+    if do_drw:
+        max_keys += AGN_BARE_MAX_KEYS
+
+    for _id in id_list:
+        feats = feature_dict[_id]
+        for key in max_keys:
+            vals = [
+                float(feats[f'{key}_{b}'])
+                for b in bands
+                if f'{key}_{b}' in feats and np.isfinite(feats[f'{key}_{b}'])
+            ]
+            feats[key] = max(vals) if vals else np.nan
+        if do_drw:
+            constrained = [
+                b for b in bands if feats.get(f'drw_fit_success_{b}', 0) == 1
+            ]
+            feats['drw_fit_success'] = 1 if constrained else 0
+            for key in AGN_BARE_MEDIAN_CONSTRAINED_KEYS:
+                vals = [
+                    float(feats[f'{key}_{b}'])
+                    for b in constrained
+                    if f'{key}_{b}' in feats and np.isfinite(feats[f'{key}_{b}'])
+                ]
+                feats[key] = float(np.median(vals)) if vals else np.nan
+    return feature_dict
+
+
 def generate_features_rubin(
     ra=None,
     dec=None,
@@ -519,6 +603,18 @@ def generate_features_rubin(
             for _id, drw_stats in zip(id_list_bs, drw_stats_list):
                 for key, val in drw_stats.items():
                     feature_dict[_id][f'{key}_{band_name}'] = val
+
+    # --- 4d. Bare AGN columns alongside the per-band ones (see the helper) ---
+    if doFlareDetection or doFastFlareDetection or doDRW:
+        print('Adding bare AGN columns aggregated across bands...')
+        add_bare_agn_columns(
+            feature_dict,
+            id_list_bs,
+            BAND_NAMES,
+            do_flare=doFlareDetection,
+            do_fast_flare=doFastFlareDetection,
+            do_drw=doDRW,
+        )
 
     # --- 5. Period Finding ---
     if doScaleMinPeriod:

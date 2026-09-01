@@ -603,3 +603,98 @@ def test_short_curve_returns_fixed_fast_keys():
     out = pdrs.calc_fast_pdrs_stats((t, np.full(3, 19.0), np.full(3, 0.01)))
     assert set(out) == set(pdrs.FAST_PDRS_FEATURE_KEYS)
     assert all(np.isnan(v) for v in out.values())
+
+
+# ---------------------------------------------------------------------------
+# TestBareAGNColumns
+# ---------------------------------------------------------------------------
+
+
+class TestBareAGNColumns:
+    """The registry addresses features by bare name, so the Rubin path must emit
+    one alongside the per-band columns.
+
+    Without this, flipping any AGN entry to include: true raises KeyError in
+    scope/utils.py, which is why the features were unreachable by training and
+    inference despite being computed and stored.
+    """
+
+    @staticmethod
+    def _rubin():
+        import importlib.util
+        import pathlib
+
+        path = (
+            pathlib.Path(__file__).parent.parent
+            / "tools"
+            / "generate_features_rubin.py"
+        )
+        spec = importlib.util.spec_from_file_location("gfr", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    BANDS = ["u", "g", "r", "i", "z", "y"]
+
+    def test_bare_columns_exist_for_every_registered_key(self):
+        gfr = self._rubin()
+        feats = {}
+        for b in self.BANDS:
+            for k in pdrs.PDRS_FEATURE_KEYS:
+                feats[f"{k}_{b}"] = 1.0
+            for k in drw.DRW_FEATURE_KEYS:
+                feats[f"{k}_{b}"] = 1.0
+        d = {1: feats}
+        gfr.add_bare_agn_columns(d, [1], self.BANDS, do_flare=True, do_drw=True)
+        for k in list(pdrs.PDRS_FEATURE_KEYS) + list(drw.DRW_FEATURE_KEYS):
+            assert k in d[1], f"bare column {k} missing"
+
+    def test_detection_statistics_take_the_maximum(self):
+        gfr = self._rubin()
+        feats = {f"n_flares_{b}": 0.0 for b in self.BANDS}
+        feats["n_flares_r"] = 3.0
+        feats["n_flares_g"] = 1.0
+        d = {1: feats}
+        gfr.add_bare_agn_columns(d, [1], self.BANDS, do_flare=True)
+        assert d[1]["n_flares"] == 3.0
+
+    def test_drw_parameters_use_only_constrained_bands(self):
+        gfr = self._rubin()
+        feats = {}
+        for b in self.BANDS:
+            feats[f"drw_tau_{b}"] = 1e5  # a rail value
+            feats[f"drw_sigma_{b}"] = 1e-4
+            feats[f"drw_fit_success_{b}"] = 0
+            feats[f"drw_max_z_{b}"] = 2.0
+        # two bands genuinely constrain the fit
+        for b, tau in (("g", 10.0), ("r", 20.0)):
+            feats[f"drw_tau_{b}"] = tau
+            feats[f"drw_sigma_{b}"] = 0.05
+            feats[f"drw_fit_success_{b}"] = 1
+        d = {1: feats}
+        gfr.add_bare_agn_columns(d, [1], self.BANDS, do_drw=True)
+        assert d[1]["drw_tau"] == 15.0  # median of 10 and 20, rails excluded
+        assert d[1]["drw_sigma"] == 0.05
+        assert d[1]["drw_fit_success"] == 1
+
+    def test_drw_is_nan_when_no_band_is_constrained(self):
+        gfr = self._rubin()
+        feats = {}
+        for b in self.BANDS:
+            feats[f"drw_tau_{b}"] = 1e5
+            feats[f"drw_sigma_{b}"] = 1e-4
+            feats[f"drw_fit_success_{b}"] = 0
+            feats[f"drw_max_z_{b}"] = 2.0
+        d = {1: feats}
+        gfr.add_bare_agn_columns(d, [1], self.BANDS, do_drw=True)
+        assert np.isnan(d[1]["drw_tau"])
+        assert np.isnan(d[1]["drw_sigma"])
+        assert d[1]["drw_fit_success"] == 0
+        assert d[1]["drw_max_z"] == 2.0  # max is unaffected by constraint
+
+    def test_all_nan_bands_give_nan_not_an_error(self):
+        gfr = self._rubin()
+        feats = {f"n_flares_{b}": np.nan for b in self.BANDS}
+        d = {1: feats}
+        gfr.add_bare_agn_columns(d, [1], self.BANDS, do_flare=True)
+        assert np.isnan(d[1]["n_flares"])
