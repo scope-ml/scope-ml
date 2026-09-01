@@ -59,7 +59,12 @@ def parse_load_config():
     """
     Load config from user-specified --config-path argument
     """
-    config_parser = argparse.ArgumentParser()
+    # add_help=False matters: this parser runs at import time in every tool
+    # that loads a config, and argparse's -h action fires during parsing even
+    # under parse_known_args. With help enabled here, `<tool> --help` printed
+    # these three options and exited before the tool's own parser was built,
+    # making every other flag undiscoverable.
+    config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument(
         "--config-path",
         type=str,

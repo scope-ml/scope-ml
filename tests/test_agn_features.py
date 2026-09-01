@@ -414,3 +414,287 @@ class TestEndToEnd:
         flared = drw.calc_drw_stats((times, mags, magerrs))
 
         assert flared['drw_max_z'] > thr
+
+
+def _variable_curve_with_dense_night(seed=7):
+    """A realistic DP2-like curve: slow intrinsic variability sampled sparsely
+    over 250 days, plus one night of dense intra-night sampling.
+
+    The point is the ratio the real data has - wstd / median_magerr is about 16
+    on DP2 - so the global scatter that stock PDRS thresholds on is set by the
+    variability, not by the noise.
+    """
+    rng = np.random.default_rng(seed)
+
+    # sparse epochs carrying the intrinsic wander
+    t_sparse = np.sort(rng.uniform(0.0, 250.0, 200)) + 60000.0
+    wander = np.cumsum(rng.standard_normal(200))
+    wander = 0.25 * wander / np.std(wander)
+
+    # one dense night, ~20 minutes of it, sitting on the same level
+    t_night = np.sort(rng.uniform(0.0, 20.0 / 1440.0, 300)) + 60125.0
+    level = np.interp(t_night, t_sparse, 19.0 + wander)
+
+    t = np.concatenate([t_sparse, t_night])
+    mag = np.concatenate([19.0 + wander, level]) + 0.01 * rng.standard_normal(500)
+    magerr = np.full(500, 0.01)
+
+    order = np.argsort(t)
+    return t[order], mag[order], magerr[order], t_night
+
+
+def test_use_snr_default_matches_stock():
+    """err=None must reproduce the global-scatter behaviour exactly."""
+    rng = np.random.default_rng(3)
+    for trial in range(20):
+        n = int(rng.integers(40, 200))
+        t = np.sort(rng.uniform(0, 250, n))
+        mag = 19 + 0.3 * rng.standard_normal(n)
+        if trial % 2 == 0:
+            t0 = rng.uniform(20, 200)
+            mag -= rng.uniform(0.3, 1.5) * np.exp(-np.abs(t - t0) / 10.0)
+        magerr = np.full(n, 0.03)
+        a = pdrs.calc_pdrs_stats((t, mag, magerr), bin_size_days=1.0)
+        b = pdrs.calc_pdrs_stats((t, mag, magerr), bin_size_days=1.0, use_snr=False)
+        for k in pdrs.PDRS_FEATURE_KEYS:
+            assert np.allclose(a[k], b[k], equal_nan=True)
+
+
+def test_use_snr_finds_a_minute_scale_flare_that_stock_misses():
+    """A 0.3 mag flare lasting minutes is well inside the intrinsic scatter of
+    a variable source, so stock PDRS - which thresholds on the global scatter -
+    does not see it. Against the per-bin measurement error it is a 30-sigma
+    excursion, which is what use_snr measures."""
+    t, mag, magerr, t_night = _variable_curve_with_dense_night()
+
+    t0 = t_night[0] + 3.0 / 1440.0
+    dur = 4.0 / 1440.0
+    hit = (t >= t0) & (t <= t0 + 4 * dur)
+    mag = mag.copy()
+    mag[hit] -= 0.3 * np.exp(-(t[hit] - t0) / dur)
+
+    # sanity: the curve is variability-dominated, like the real data
+    assert np.std(mag) / np.median(magerr) > 10
+
+    stock = pdrs.calc_pdrs_stats(
+        (t, mag, magerr),
+        bin_size_days=1.0,
+        peak_threshold=2.0,
+        min_cluster_size=3,
+        max_gap_days=60.0,
+        smooth_window=3,
+        region_threshold=0.3,
+    )
+    fast = pdrs.calc_pdrs_stats(
+        (t, mag, magerr),
+        bin_size_days=2.0 / 1440.0,
+        peak_threshold=8.0,
+        min_cluster_size=3,
+        max_gap_days=30.0 / 1440.0,
+        smooth_window=3,
+        region_threshold=1.0,
+        use_snr=True,
+    )
+    assert stock['n_flares'] == 0
+    assert fast['n_flares'] >= 1
+    assert fast['flare_significance'] > 5.0
+
+
+def test_flare_regions_bracket_the_event():
+    """flare_regions returns the interval calc_pdrs_stats discards."""
+    rng = np.random.default_rng(11)
+    t = np.sort(rng.uniform(0, 200, 300)) + 60000.0
+    mag = 19 + 0.02 * rng.standard_normal(300)
+    t0 = 60100.0
+    mag -= 1.0 * np.exp(-np.abs(t - t0) / 5.0)
+    magerr = np.full(300, 0.02)
+
+    params = dict(
+        bin_size_days=1.0,
+        peak_threshold=2.0,
+        min_cluster_size=3,
+        max_gap_days=60.0,
+        smooth_window=3,
+        region_threshold=0.3,
+    )
+    regions = pdrs.flare_regions((t, mag, magerr), **params)
+    stats = pdrs.calc_pdrs_stats((t, mag, magerr), **params)
+
+    assert len(regions) == stats['n_flares']
+    assert any(start <= t0 <= end for start, end in regions)
+    for start, end in regions:
+        assert end >= start
+
+
+def test_mask_regions_keeps_the_flare_out_of_the_drw_fit():
+    """A flare inflates the fitted sigma; masking its interval recovers it,
+    and the event is still visible in drw_max_z because residuals are
+    evaluated on every point."""
+    rng = np.random.default_rng(5)
+    t = np.sort(rng.uniform(0, 250, 250)) + 60000.0
+    mag = 19 + 0.05 * rng.standard_normal(250)
+    magerr = np.full(250, 0.02)
+
+    clean = drw.calc_drw_stats((t, mag, magerr))
+
+    t0 = 60120.0
+    flared = mag - 1.5 * np.exp(-np.abs(t - t0) / 4.0)
+    dirty = drw.calc_drw_stats((t, flared, magerr))
+    masked = drw.calc_drw_stats((t, flared, magerr), mask_regions=[(t0 - 20, t0 + 20)])
+
+    assert dirty['drw_sigma'] > clean['drw_sigma']
+    assert masked['drw_sigma'] < dirty['drw_sigma']
+    assert np.isfinite(masked['drw_max_z'])
+
+
+def test_mask_regions_covering_everything_falls_back():
+    """Masking the whole curve would leave nothing to fit; the fit must still
+    be attempted on all points rather than returning NaN."""
+    rng = np.random.default_rng(9)
+    t = np.sort(rng.uniform(0, 100, 60)) + 60000.0
+    mag = 19 + 0.05 * rng.standard_normal(60)
+    magerr = np.full(60, 0.02)
+    out = drw.calc_drw_stats((t, mag, magerr), mask_regions=[(59000.0, 61000.0)])
+    ref = drw.calc_drw_stats((t, mag, magerr))
+    assert np.isfinite(out['drw_max_z'])
+    assert np.allclose(out['drw_max_z'], ref['drw_max_z'], equal_nan=True)
+
+
+def test_fast_and_slow_features_coexist():
+    """The two modes emit disjoint key sets, so a light curve can carry both."""
+    assert not set(pdrs.PDRS_FEATURE_KEYS) & set(pdrs.FAST_PDRS_FEATURE_KEYS)
+
+    t, mag, magerr, t_night = _variable_curve_with_dense_night(seed=13)
+    t0 = t_night[0] + 3.0 / 1440.0
+    dur = 4.0 / 1440.0
+    hit = (t >= t0) & (t <= t0 + 4 * dur)
+    mag = mag.copy()
+    mag[hit] -= 0.3 * np.exp(-(t[hit] - t0) / dur)
+
+    slow = pdrs.calc_pdrs_stats((t, mag, magerr), bin_size_days=1.0)
+    fast = pdrs.calc_fast_pdrs_stats((t, mag, magerr))
+
+    assert set(slow) == set(pdrs.PDRS_FEATURE_KEYS)
+    assert set(fast) == set(pdrs.FAST_PDRS_FEATURE_KEYS)
+
+    merged = {**slow, **fast}
+    assert len(merged) == len(pdrs.PDRS_FEATURE_KEYS) + len(pdrs.FAST_PDRS_FEATURE_KEYS)
+
+    # the wrapper is the same detector, only renamed
+    direct = pdrs.calc_pdrs_stats(
+        (t, mag, magerr),
+        bin_size_days=pdrs.FAST_BIN_SIZE_DAYS,
+        peak_threshold=pdrs.FAST_PEAK_THRESHOLD,
+        smooth_window=pdrs.FAST_SMOOTH_WINDOW,
+        min_cluster_size=pdrs.DEFAULT_MIN_CLUSTER_SIZE,
+        saddle_ratio=pdrs.DEFAULT_SADDLE_RATIO,
+        region_threshold=pdrs.FAST_REGION_THRESHOLD,
+        max_gap_days=pdrs.FAST_MAX_GAP_DAYS,
+        use_snr=True,
+    )
+    for slow_key, fast_key in zip(pdrs.PDRS_FEATURE_KEYS, pdrs.FAST_PDRS_FEATURE_KEYS):
+        assert np.allclose(direct[slow_key], fast[fast_key], equal_nan=True)
+
+
+def test_short_curve_returns_fixed_fast_keys():
+    """Too few points must still yield every fast key, so the column set does
+    not depend on which sources happened to be measurable."""
+    t = np.array([60000.0, 60000.1, 60000.2])
+    out = pdrs.calc_fast_pdrs_stats((t, np.full(3, 19.0), np.full(3, 0.01)))
+    assert set(out) == set(pdrs.FAST_PDRS_FEATURE_KEYS)
+    assert all(np.isnan(v) for v in out.values())
+
+
+# ---------------------------------------------------------------------------
+# TestBareAGNColumns
+# ---------------------------------------------------------------------------
+
+
+class TestBareAGNColumns:
+    """The registry addresses features by bare name, so the Rubin path must emit
+    one alongside the per-band columns.
+
+    Without this, flipping any AGN entry to include: true raises KeyError in
+    scope/utils.py, which is why the features were unreachable by training and
+    inference despite being computed and stored.
+    """
+
+    @staticmethod
+    def _rubin():
+        import importlib.util
+        import pathlib
+
+        path = (
+            pathlib.Path(__file__).parent.parent
+            / "tools"
+            / "generate_features_rubin.py"
+        )
+        spec = importlib.util.spec_from_file_location("gfr", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    BANDS = ["u", "g", "r", "i", "z", "y"]
+
+    def test_bare_columns_exist_for_every_registered_key(self):
+        gfr = self._rubin()
+        feats = {}
+        for b in self.BANDS:
+            for k in pdrs.PDRS_FEATURE_KEYS:
+                feats[f"{k}_{b}"] = 1.0
+            for k in drw.DRW_FEATURE_KEYS:
+                feats[f"{k}_{b}"] = 1.0
+        d = {1: feats}
+        gfr.add_bare_agn_columns(d, [1], self.BANDS, do_flare=True, do_drw=True)
+        for k in list(pdrs.PDRS_FEATURE_KEYS) + list(drw.DRW_FEATURE_KEYS):
+            assert k in d[1], f"bare column {k} missing"
+
+    def test_detection_statistics_take_the_maximum(self):
+        gfr = self._rubin()
+        feats = {f"n_flares_{b}": 0.0 for b in self.BANDS}
+        feats["n_flares_r"] = 3.0
+        feats["n_flares_g"] = 1.0
+        d = {1: feats}
+        gfr.add_bare_agn_columns(d, [1], self.BANDS, do_flare=True)
+        assert d[1]["n_flares"] == 3.0
+
+    def test_drw_parameters_use_only_constrained_bands(self):
+        gfr = self._rubin()
+        feats = {}
+        for b in self.BANDS:
+            feats[f"drw_tau_{b}"] = 1e5  # a rail value
+            feats[f"drw_sigma_{b}"] = 1e-4
+            feats[f"drw_fit_success_{b}"] = 0
+            feats[f"drw_max_z_{b}"] = 2.0
+        # two bands genuinely constrain the fit
+        for b, tau in (("g", 10.0), ("r", 20.0)):
+            feats[f"drw_tau_{b}"] = tau
+            feats[f"drw_sigma_{b}"] = 0.05
+            feats[f"drw_fit_success_{b}"] = 1
+        d = {1: feats}
+        gfr.add_bare_agn_columns(d, [1], self.BANDS, do_drw=True)
+        assert d[1]["drw_tau"] == 15.0  # median of 10 and 20, rails excluded
+        assert d[1]["drw_sigma"] == 0.05
+        assert d[1]["drw_fit_success"] == 1
+
+    def test_drw_is_nan_when_no_band_is_constrained(self):
+        gfr = self._rubin()
+        feats = {}
+        for b in self.BANDS:
+            feats[f"drw_tau_{b}"] = 1e5
+            feats[f"drw_sigma_{b}"] = 1e-4
+            feats[f"drw_fit_success_{b}"] = 0
+            feats[f"drw_max_z_{b}"] = 2.0
+        d = {1: feats}
+        gfr.add_bare_agn_columns(d, [1], self.BANDS, do_drw=True)
+        assert np.isnan(d[1]["drw_tau"])
+        assert np.isnan(d[1]["drw_sigma"])
+        assert d[1]["drw_fit_success"] == 0
+        assert d[1]["drw_max_z"] == 2.0  # max is unaffected by constraint
+
+    def test_all_nan_bands_give_nan_not_an_error(self):
+        gfr = self._rubin()
+        feats = {f"n_flares_{b}": np.nan for b in self.BANDS}
+        d = {1: feats}
+        gfr.add_bare_agn_columns(d, [1], self.BANDS, do_flare=True)
+        assert np.isnan(d[1]["n_flares"])
