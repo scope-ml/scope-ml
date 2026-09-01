@@ -197,8 +197,14 @@ def find_periods(
             algo = periodfind.MultiHarmonicFourier(max_harmonics=3, device=device)
 
         # Prepare data
-        # Pass band arrays for MHF so per-band means are subtracted
-        prep_bands = bands if algo_name == "MHF" else None
+        # Per-band weighted means are subtracted for every algorithm.  Rubin
+        # merges all six bands into one series before period finding, and the
+        # chromatic offsets between them are far larger than the variability:
+        # on a typical DP2 object the merged scatter is 0.985 mag against
+        # 0.09-0.15 mag within any band, so ~85-90% of what an algorithm sees is
+        # which filter was used.  This was previously applied to MHF alone,
+        # which is why MHF appeared 4-7x more accurate than the rest.
+        prep_bands = bands
         if needs_errs:
             time_stack, mag_stack, err_stack = _prepare_lightcurves(
                 lightcurves,
@@ -287,12 +293,19 @@ def find_periods(
 def extract_top_n_periods(periodogram_results, freqs, n_top=8, n_chunks_multiplier=3):
     """Extract top N periods from periodogram using hybrid chunking.
 
-    The frequency grid is divided into ``n_chunks_multiplier * n_top``
-    equal-width chunks.  The single best peak from each chunk is recorded,
+    The grid is divided into ``n_chunks_multiplier * n_top`` chunks of equal
+    width in *log period*.  The single best peak from each chunk is recorded,
     then all chunk-winners are ranked by significance and the top ``n_top``
     are returned.  This guarantees that the returned periods come from
     distinct regions of frequency space, avoiding the adjacent-bin
     duplication problem of the previous sort-and-take approach.
+
+    Chunking in log period rather than in frequency matters whenever the
+    frequency grid spans a wide dynamic range.  Equal-width frequency chunks
+    are wildly unequal in period: over a 0.0084-288 c/d grid, 150 such chunks
+    place every period longer than 0.52 d into the first chunk, capping the
+    long-period share of the returned peaks at 1/150 no matter how strong
+    those peaks are.
 
     Parameters
     ----------
@@ -323,6 +336,13 @@ def extract_top_n_periods(periodogram_results, freqs, n_top=8, n_chunks_multipli
 
     n_chunks = n_chunks_multiplier * n_top
 
+    # Chunk boundaries in log period, computed once for all sources.
+    order_p = np.argsort(periods_grid)
+    p_sorted = periods_grid[order_p]
+    edges = np.logspace(np.log10(p_sorted[0]), np.log10(p_sorted[-1]), n_chunks + 1)
+    edges[-1] = np.nextafter(edges[-1], np.inf)
+    bounds = np.searchsorted(p_sorted, edges)
+
     for i, res in enumerate(periodogram_results):
         data = res['data'].flatten()
         n_freqs = len(data)
@@ -339,8 +359,7 @@ def extract_top_n_periods(periodogram_results, freqs, n_top=8, n_chunks_multipli
         best_period = res['period']
         use_minima = np.isclose(periods_grid[best_idx_min], best_period, rtol=1e-4)
 
-        chunk_size = n_freqs // n_chunks
-        if chunk_size < 1:
+        if n_freqs < n_chunks:
             # Fewer frequency bins than chunks — fall back to simple sort
             if use_minima:
                 sorted_indices = np.argsort(data)
@@ -352,23 +371,29 @@ def extract_top_n_periods(periodogram_results, freqs, n_top=8, n_chunks_multipli
             top_significances[i, :n_fill] = sigs[:n_fill]
             continue
 
-        # Find best peak in each chunk
-        chunk_periods = np.empty(n_chunks, dtype=np.float64)
-        chunk_sigs = np.empty(n_chunks, dtype=np.float64)
+        # Find best peak in each log-period chunk.  Chunks holding no grid
+        # points are skipped: at long periods the frequency grid is genuinely
+        # sparse, and an empty chunk means there is no independent frequency
+        # there to report.
+        chunk_periods = []
+        chunk_sigs = []
 
         for c in range(n_chunks):
-            lo = c * chunk_size
-            hi = lo + chunk_size if c < n_chunks - 1 else n_freqs
-            chunk_data = data[lo:hi]
+            idx = order_p[bounds[c] : bounds[c + 1]]
+            if idx.size == 0:
+                continue
+            chunk_data = data[idx]
 
             if use_minima:
-                best_local = np.argmin(chunk_data)
+                best_global = idx[np.argmin(chunk_data)]
             else:
-                best_local = np.argmax(chunk_data)
+                best_global = idx[np.argmax(chunk_data)]
 
-            best_global = lo + best_local
-            chunk_periods[c] = periods_grid[best_global]
-            chunk_sigs[c] = abs(data[best_global] - mean_val) / std_val
+            chunk_periods.append(periods_grid[best_global])
+            chunk_sigs.append(abs(data[best_global] - mean_val) / std_val)
+
+        chunk_periods = np.asarray(chunk_periods, dtype=np.float64)
+        chunk_sigs = np.asarray(chunk_sigs, dtype=np.float64)
 
         # Rank by significance and keep top n_top
         order = np.argsort(chunk_sigs)[::-1]

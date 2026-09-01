@@ -358,6 +358,30 @@ class TestExtractTopNPeriods:
             near_peak <= 1
         ), f"Expected at most 1 entry near P=0.5, got {near_peak}: {top_p[0]}"
 
+    def test_long_periods_not_crowded_out(self):
+        """Peaks spread over decades all survive, none crowded out by short ones.
+
+        Chunks of equal width in frequency are wildly unequal in period: over a
+        DP2-like 0.0084-288 c/d grid they collapse everything above ~0.1 d into
+        a single chunk, so only one long-period peak can ever be returned.
+        Chunking in log period gives each decade its own chunks.
+        """
+        freqs = make_freq_grid(0.0084, 288.0, 100000)
+        periods_grid = 1.0 / freqs
+        data = np.zeros(len(freqs), dtype=np.float64)
+
+        targets = [0.01, 0.05, 0.5, 5.0, 50.0]
+        for p in targets:
+            data[int(np.argmin(np.abs(periods_grid - p)))] = 10.0
+
+        pg_result = [{'period': periods_grid[int(np.argmax(data))], 'data': data}]
+        top_p, _ = extract_top_n_periods(pg_result, freqs, n_top=8)
+
+        for p in targets:
+            assert any(
+                not np.isnan(q) and np.isclose(q, p, rtol=0.05) for q in top_p[0]
+            ), f"P={p} d missing from {top_p[0]}"
+
     def test_n_chunks_multiplier_controls_diversity(self):
         """Higher n_chunks_multiplier increases period diversity."""
         freqs = make_freq_grid(0.1, 5.0, 2000)
