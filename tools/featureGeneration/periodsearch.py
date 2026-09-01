@@ -197,8 +197,14 @@ def find_periods(
             algo = periodfind.MultiHarmonicFourier(max_harmonics=3, device=device)
 
         # Prepare data
-        # Pass band arrays for MHF so per-band means are subtracted
-        prep_bands = bands if algo_name == "MHF" else None
+        # Per-band weighted means are subtracted for every algorithm.  Rubin
+        # merges all six bands into one series before period finding, and the
+        # chromatic offsets between them are far larger than the variability:
+        # on a typical DP2 object the merged scatter is 0.985 mag against
+        # 0.09-0.15 mag within any band, so ~85-90% of what an algorithm sees is
+        # which filter was used.  This was previously applied to MHF alone,
+        # which is why MHF appeared 4-7x more accurate than the rest.
+        prep_bands = bands
         if needs_errs:
             time_stack, mag_stack, err_stack = _prepare_lightcurves(
                 lightcurves,
