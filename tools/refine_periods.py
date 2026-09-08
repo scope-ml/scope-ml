@@ -14,8 +14,8 @@ trial period already stored by feature generation, and reports the period the
 model prefers.  No new period search is performed.
 
 Measured on 3,866 DP2 sources matched to Gaia DR3 eclipsing binaries, exact
-agreement with the Gaia period (within 2 per cent) rises from 0.9 to 21.6 per
-cent, correcting 829 periods while changing 26 correct ones to incorrect.  For
+agreement with the Gaia period (within 2 per cent) rises from 0.9 to 21.2 per
+cent, correcting 813 periods while changing 26 correct ones to incorrect.  For
 406 RR Lyrae it rises from 38.9 to 48.3 per cent.  Sources whose class has no
 registered model keep their original period.
 
@@ -38,17 +38,38 @@ import numpy as np
 import pandas as pd
 
 from scope.surveys.rubin import DEFAULT_BAND_MAP
+from scope.utils import parse_load_config
 from tools.periodRefinement import lookup, supported
 from tools.periodRefinement.preprocess import prepare_all
 
 ALGORITHMS = ("LS", "CE", "AOV", "FPW", "MHF")
-#: filter id -> band name.  Both surveys hand back integer filter ids in the
+#: filter id -> band name.  The survey hands back integer filter ids in the
 #: Kowalski format, and integers make poor feature names: eclipse depth ratios
 #: are per band and only mean something with the band attached.
-ZTF_BANDS = {1: "g", 2: "r", 3: "i"}
 RUBIN_BANDS = {v: k for k, v in DEFAULT_BAND_MAP.items()}
 DEDUP_TOLERANCE = 0.01
-DEFAULT_N_PERIODS = 20
+DEFAULT_N_PERIODS = 50
+
+
+def load_config_if_any():
+    """The config if the working directory has one, otherwise an empty dict.
+
+    Other tools load a config unconditionally.  This one also runs from job
+    scripts that pass the data path in the environment, with no checkout in the
+    working directory, so an absent config is not an error here -- the survey
+    client falls back to RUBIN_DATA_PATH / RUBIN_DP2_DATA_PATH.  What is an
+    error is ignoring a config that does exist, which is what this tool did
+    before: a data path configured the documented way was silently unused.
+    """
+    try:
+        return parse_load_config() or {}
+    except FileNotFoundError:
+        print(
+            "No config.yaml in the working directory; relying on "
+            "RUBIN_DATA_PATH / RUBIN_DP2_DATA_PATH for data access.",
+            flush=True,
+        )
+        return {}
 
 
 def load_lightcurves(identifiers, survey, config=None, **cleaning):
@@ -72,10 +93,16 @@ def load_lightcurves(identifiers, survey, config=None, **cleaning):
             **cleaning,
         )
     if survey == "ztf":
-        from scope.surveys.fritz import get_lightcurves_via_ids
-
-        return prepare_all(
-            get_lightcurves_via_ids(identifiers), band_names=ZTF_BANDS, **cleaning
+        # Kept explicit rather than silently unknown: this path shipped calling
+        # get_lightcurves_via_ids(ids), which has required kowalski_instances
+        # and catalog arguments, so it raised TypeError for anyone who tried
+        # it.  Implementing it means building Kowalski instances from the
+        # config as tools/generate_features.py does, and it has never been
+        # validated against ZTF data.
+        raise NotImplementedError(
+            "the ZTF path is not implemented; fetching ZTF light curves needs "
+            "Kowalski instances built from the config, as generate_features.py "
+            "does.  Only --survey rubin is supported."
         )
     raise ValueError(f"unknown survey {survey!r}")
 
@@ -88,9 +115,10 @@ def collect_trial_periods(
     Feature generation keeps the top N peaks from each algorithm.  Offering all
     of them is not free: on the validation set, 57 per cent of the sources that
     end up with a wrong period are given an alias that genuinely fits better
-    than the truth, and more candidates means more chances to meet one.  Going
-    from 50 to 20 per algorithm left overall accuracy unchanged while costing
-    2.5 times less, so 20 is the default.
+    than the truth, and more candidates means more chances to meet one.  All 50
+    are offered by default, which is what the quoted accuracies were measured
+    at; 20 per algorithm costs 2.5 times less and scores within a few tenths of
+    a point, on a lower ceiling.
     """
     values = []
     for i in range(1, n_per_algorithm + 1):
@@ -186,7 +214,7 @@ def build_parser():
     parser.add_argument(
         "--survey",
         default="rubin",
-        choices=("rubin", "ztf"),
+        choices=("rubin",),
         help="where to fetch light curves from " "(default: %(default)s)",
     )
     parser.add_argument("--chunk", type=int, default=0)
@@ -196,6 +224,7 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    config = load_config_if_any()
 
     wanted = None
     if args.class_filter:
@@ -237,6 +266,7 @@ def main():
     lightcurves = load_lightcurves(
         [int(x) for x in identifiers],
         args.survey,
+        config=config.get("rubin", {}),
         min_cadence_minutes=args.min_cadence_minutes,
     )
     print(f"light curves for {len(lightcurves)} of them", flush=True)
