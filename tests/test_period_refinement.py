@@ -11,7 +11,12 @@ import pytest
 
 from tools.periodRefinement import eclipsing, lookup, pulsating, supported
 from tools.periodRefinement.preprocess import prepare_all, prepare_lightcurve
-from tools.refine_periods import collect_trial_periods, refine_one
+from tools.refine_periods import (
+    build_parser,
+    collect_trial_periods,
+    load_lightcurves,
+    refine_one,
+)
 
 
 RNG = np.random.default_rng(20260907)
@@ -333,3 +338,107 @@ class TestPreprocessing:
     def test_empty_input_is_not_an_error(self):
         assert prepare_all([]) == {}
         assert prepare_all(None) == {}
+
+
+# The light curve fetch had no test at all, which is how a ZTF call with two
+# missing required arguments, and a config that was never read, both shipped.
+
+
+def test_ztf_survey_fails_with_an_explanation():
+    with pytest.raises(NotImplementedError, match="Kowalski"):
+        load_lightcurves([1, 2], "ztf")
+
+
+def test_unknown_survey_is_rejected():
+    with pytest.raises(ValueError, match="unknown survey"):
+        load_lightcurves([1, 2], "hsc")
+
+
+def test_parser_offers_only_implemented_surveys():
+    args = build_parser().parse_args(
+        ["--features", "f.parquet", "--output", "o.parquet"]
+    )
+    assert args.survey == "rubin"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            ["--features", "f.parquet", "--output", "o.parquet", "--survey", "ztf"]
+        )
+
+
+def test_configured_data_path_reaches_the_rubin_client(monkeypatch):
+    """A data path set the documented way must not be ignored."""
+    import scope.surveys.rubin as rubin_module
+
+    seen = {}
+
+    class FakeClient:
+        def get_lightcurves(self, identifiers):
+            seen["ids"] = list(identifiers)
+            return []
+
+    def fake_make_rubin_client(config=None, use_dia=False, release=None):
+        seen["config"] = config
+        seen["use_dia"] = use_dia
+        seen["release"] = release
+        return FakeClient()
+
+    monkeypatch.setattr(rubin_module, "make_rubin_client", fake_make_rubin_client)
+    out = load_lightcurves([7], "rubin", config={"dp2_data_path": "/data/dp2.parquet"})
+    assert out == {}
+    assert seen["config"] == {"dp2_data_path": "/data/dp2.parquet"}
+    assert seen["use_dia"] is True
+    assert seen["ids"] == [7]
+
+
+def test_missing_config_is_not_fatal(monkeypatch):
+    """Running from a job script with no checkout must still work."""
+    import tools.refine_periods as refine
+
+    def raise_missing():
+        raise FileNotFoundError("config.yaml")
+
+    monkeypatch.setattr(refine, "parse_load_config", raise_missing)
+    assert refine.load_config_if_any() == {}
+
+
+def test_main_hands_the_configured_path_to_the_fetch(tmp_path, monkeypatch):
+    """The config bug was in main(), not in the fetch it calls."""
+    import pandas as pd
+
+    import tools.refine_periods as refine
+
+    features = tmp_path / "features.parquet"
+    pd.DataFrame({"_id": [1], "best_agree_period": [0.5], "class": ["ECL"]}).to_parquet(
+        features, index=False
+    )
+
+    seen = {}
+
+    def fake_load_lightcurves(identifiers, survey, config=None, **cleaning):
+        seen["config"] = config
+        seen["cleaning"] = cleaning
+        return {}
+
+    monkeypatch.setattr(refine, "load_lightcurves", fake_load_lightcurves)
+    monkeypatch.setattr(
+        refine,
+        "parse_load_config",
+        lambda: {"rubin": {"dp2_data_path": "/data/dp2.parquet"}},
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "refine-periods",
+            "--features",
+            str(features),
+            "--output",
+            str(tmp_path / "out.parquet"),
+            "--min-cadence-minutes",
+            "0",
+        ],
+    )
+
+    refine.main()
+
+    assert seen["config"] == {"dp2_data_path": "/data/dp2.parquet"}
+    assert seen["cleaning"]["min_cadence_minutes"] == 0

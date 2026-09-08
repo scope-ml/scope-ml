@@ -46,8 +46,19 @@ on this data, so you can trade completeness for accuracy:
 refine-periods \
     --features generated_features/combined.parquet \
     --classes  classifications.parquet \
-    --output   combined_refined.parquet
+    --output   combined_refined.parquet \
+    --min-cadence-minutes 0
 ```
+
+Stored trial periods are not sufficient on their own: the models are fitted
+to the photometry, so the light curves are fetched again. Point the tool at
+them the same way `generate-features-rubin` does, with `rubin.data_path` or
+`rubin.dp2_data_path` in `config.yaml`, or with `RUBIN_DATA_PATH` /
+`RUBIN_DP2_DATA_PATH` in the environment when running from a job script with
+no checkout in the working directory. `RUBIN_RELEASE` selects the release and
+defaults to `dp2`.
+
+Only `--survey rubin` is implemented.
 
 The input is never modified. The output is the input table plus four columns:
 
@@ -88,9 +99,10 @@ difference was 18.3% against 21.7% exact, and the two settings agreed on only
 23% of individual periods.
 
 `--n-periods` sets how many stored peaks per algorithm are offered (default 50,
-all of them). 20 gives 21.6% against 21.2% at 2.5× lower cost, but lowers the
-ceiling: the true period is present for 79.2% of eclipsing binaries in the top
-20 against 90.6% in the top 50.
+all of them, which is what the results above were measured at). 20 gives 21.6%
+against 21.2% at 2.5× lower cost, but lowers the ceiling: the true period is
+present for 79.2% of eclipsing binaries in the top 20 against 90.6% in the top
+50.
 
 `--class-filter ECL` restricts to particular classes. `--chunk`/`--n-chunks`
 split the work across a job array.
@@ -184,14 +196,17 @@ micro-optimisation does not: rewriting the array code in pure numpy gained 1.7x,
 while compiling the residual evaluation and the small linear solve together
 gained 4.2x on top of it.
 
-At the default 50 trial periods per algorithm, roughly **2.6 s/object** for
-eclipsing binaries and **0.3 s/object** for pulsators, single core:
+At the default 50 trial periods per algorithm, measured on Rubin DP2:
+**1.4 s/object** for eclipsing binaries and **0.3 s/object** for pulsators,
+single core, excluding the light curve fetch.
 
 | scope | n | core-hours |
 |---|---|---|
-| Gaia validation set (eclipsing) | 3,866 | 2.8 |
-| DP2 eclipsing subset | ~49,000 | 35 |
-| full DP2, ungated | 328,285 | 237 |
+| Gaia validation set (eclipsing) | 3,866 | 1.5 |
+| full DP2, ungated | 328,285 | 128 |
+
+Gated to a class the figure is lower in proportion to how much of the sample
+that class accounts for, which is not yet known for DP2.
 
 The work is per-source and independent, so `--chunk`/`--n-chunks` parallelise it
 across a job array with no coordination.
