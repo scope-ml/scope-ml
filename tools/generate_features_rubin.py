@@ -179,6 +179,63 @@ def add_bare_agn_columns(
     return feature_dict
 
 
+def spike_mask(times, mags, bands, floor=1.0):
+    """Points to keep after removing single-point spikes, per band.
+
+    Each point is compared with the median of itself and its nearest surviving
+    neighbours in time (a window of three), not with the band median: a global
+    clip removes real eclipses, because the flat out-of-eclipse baseline sets
+    the scatter and the eclipse is then many sigma from the median. A point
+    further than ``floor`` magnitudes from that local median is dropped at once,
+    and the window closes over it. The first and last surviving points are
+    checked against their only neighbour.
+
+    Parameters
+    ----------
+    times, mags : array_like
+        Observation times and magnitudes.
+    bands : array_like
+        Band label of each point.
+    floor : float
+        Spike threshold in magnitudes; ``np.inf`` keeps every point.
+
+    Returns
+    -------
+    numpy.ndarray of bool
+        True for points to keep.
+    """
+    times = np.asarray(times)
+    mags = np.asarray(mags)
+    bands = np.asarray(bands)
+    keep = np.ones(len(mags), dtype=bool)
+    if not np.isfinite(floor):
+        return keep
+    for b_val in np.unique(bands):
+        idx = np.where(bands == b_val)[0]
+        if len(idx) < 3:
+            continue
+        idx = idx[np.argsort(times[idx], kind="stable")]
+        y = mags[idx]
+        alive = np.ones(len(idx), dtype=bool)
+        left, centre, right = 0, 1, 2
+        while right < len(idx):
+            d = abs(y[centre] - np.median([y[left], y[centre], y[right]]))
+            if d > floor:
+                alive[centre] = False
+                centre = right  # left stays, the window closes
+            else:
+                left, centre = centre, right
+            right += 1
+        live = np.where(alive)[0]
+        if len(live) >= 2:
+            if abs(y[live[0]] - y[live[1]]) > floor:
+                alive[live[0]] = False
+            if abs(y[live[-1]] - y[live[-2]]) > floor:
+                alive[live[-1]] = False
+        keep[idx[~alive]] = False
+    return keep
+
+
 def generate_features_rubin(
     ra=None,
     dec=None,
@@ -195,6 +252,7 @@ def generate_features_rubin(
     Ncore=8,
     min_n_lc_points=period_search_config.get('min_n_lc_points', 50),
     min_cadence_minutes=period_search_config.get('min_cadence_minutes', 5.0),
+    spike_floor_mag=period_search_config.get('spike_floor_mag', 1.0),
     dirname='/fred/oz480/mcoughli/generated_features_rubin',
     filename='gen_features_rubin',
     doFlareDetection=False,
@@ -248,6 +306,10 @@ def generate_features_rubin(
         Minimum lightcurve points required.
     min_cadence_minutes : float
         Minimum cadence between points.
+    spike_floor_mag : float
+        Drop single-point spikes further than this many magnitudes from the
+        median of their two neighbours in time (see ``spike_mask``); np.inf
+        keeps every point.
     dirname : str
         Output directory name.
     filename : str
@@ -424,19 +486,10 @@ def generate_features_rubin(
                 tt, mm, ee = t, m, e
                 bb = band_arr
 
-            # Sigma-clip outliers per band (5-sigma MAD)
-            # Use 5-sigma to only reject catastrophic outliers — these are
-            # variable stars so 3-sigma would clip real variability.
-            clip_mask = np.ones(len(tt), dtype=bool)
-            for b_val in np.unique(bb):
-                b_mask = bb == b_val
-                if b_mask.sum() < 5:
-                    continue
-                med = np.median(mm[b_mask])
-                mad = np.median(np.abs(mm[b_mask] - med))
-                sigma_est = mad * 1.4826  # MAD to Gaussian sigma
-                if sigma_est > 0:
-                    clip_mask[b_mask] &= np.abs(mm[b_mask] - med) < 5.0 * sigma_est
+            # Remove single-point spikes against their neighbours in time,
+            # not against the band median: a 5-sigma MAD clip removes the
+            # eclipses of detached binaries (see spike_mask).
+            clip_mask = spike_mask(tt, mm, bb, floor=spike_floor_mag)
             if clip_mask.sum() < len(tt):
                 tt, mm, ee = tt[clip_mask], mm[clip_mask], ee[clip_mask]
                 bb = bb[clip_mask]
@@ -1455,6 +1508,12 @@ def get_parser(**kwargs):
         help="Minimum cadence between lightcurve points (minutes)",
     )
     parser.add_argument(
+        "--spike-floor-mag",
+        type=float,
+        default=period_search_config.get('spike_floor_mag', 1.0),
+        help="Spike filter threshold in magnitudes (inf disables)",
+    )
+    parser.add_argument(
         "--phase-bins",
         type=int,
         default=period_search_config.get('phase_bins', 20),
@@ -1595,6 +1654,7 @@ def main():
         Ncore=args.Ncore,
         min_n_lc_points=args.min_n_lc_points,
         min_cadence_minutes=min_cadence,
+        spike_floor_mag=args.spike_floor_mag,
         dirname=args.dirname,
         filename=args.filename,
         doFlareDetection=args.doFlareDetection,
