@@ -1637,6 +1637,9 @@ feature_generation:
     # Minimum cadence between lightcurve points in minutes
     # (points closer together are merged by removeHighCadence)
     min_cadence_minutes: 5.0
+    # Single-point spike filter: drop a point further than this many magnitudes
+    # from the median of its two neighbours in time, per band (.inf disables)
+    spike_floor_mag: 1.0
     # Number of phase/magnitude bins for CE, AOV, FPW
     phase_bins: 20
     mag_bins: 10
